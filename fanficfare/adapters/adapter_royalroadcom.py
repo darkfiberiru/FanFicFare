@@ -64,22 +64,66 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         # Maps chapter_id -> wayback timestamp for chapters that need Wayback fetch
         self.wayback_chapters = {}
 
-    def _make_wayback_image_fetch(self, timestamp=None):
-        """Create a fetch function that falls back to Wayback Machine on image failure.
-        If timestamp is provided, tries that snapshot first; then queries CDX
-        for other available snapshots, skipping redirect captures."""
+    def _make_image_fetch(self, wayback_ts=None):
+        """Create a fetch function that:
+        1. Falls back to Wayback Machine on image failure
+        2. Extracts first frame from large animated GIF/WebP (over 1MB)
+        3. Compresses other large images (over 1MB)"""
         original_fetch = self.get_request_raw
         adapter = self
-        def wayback_fallback_fetch(url, **kwargs):
+        def image_fetch_wrapper(url, **kwargs):
             try:
-                return original_fetch(url, **kwargs)
+                data = original_fetch(url, **kwargs)
             except Exception:
                 if kwargs.get('image', False):
                     logger.info("Image fetch failed for %s, trying Wayback Machine"
                                 % url)
-                    return adapter._wayback_fetch_image(url, timestamp)
-                raise
-        return wayback_fallback_fetch
+                    data = adapter._wayback_fetch_image(url, wayback_ts)
+                else:
+                    raise
+            if kwargs.get('image', False) and len(data) > 1000000:
+                data = adapter._flatten_large_image(data, url)
+            return data
+        return image_fetch_wrapper
+
+    def _flatten_large_image(self, data, url):
+        """For images over 1MB: extract first frame from animated GIF/WebP,
+        or compress static images to JPEG."""
+        try:
+            from PIL import Image
+            from io import BytesIO
+            img = Image.open(BytesIO(data))
+
+            # Animated GIF/WebP: extract first frame
+            if getattr(img, 'is_animated', False):
+                img.seek(0)
+                if img.mode not in ('RGB', 'L'):
+                    img = img.convert('RGB')
+                out = BytesIO()
+                img.save(out, 'JPEG', quality=85, optimize=True)
+                result = out.getvalue()
+                logger.info("Extracted first frame from %dKB animated %s "
+                            "-> %dKB JPEG: %s"
+                            % (len(data) // 1024,
+                               img.format or 'image',
+                               len(result) // 1024, url))
+                return result
+
+            # Static image over 1MB: compress to JPEG
+            if img.mode not in ('RGB', 'L'):
+                img = img.convert('RGB')
+            out = BytesIO()
+            img.save(out, 'JPEG', quality=75, optimize=True)
+            result = out.getvalue()
+            if len(result) < len(data):
+                logger.info("Compressed %dKB %s -> %dKB JPEG: %s"
+                            % (len(data) // 1024,
+                               img.format or 'image',
+                               len(result) // 1024, url))
+                return result
+        except Exception as e:
+            logger.debug("Image compression failed for %s: %s" % (url, e))
+        return data
 
     def _is_wayback_redirect_capture(self, data):
         """Check if Wayback response is a redirect capture page instead of
@@ -710,7 +754,7 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         for element in div.find_all(has_display_none_style):
             element.extract()
 
-        # Use a fetch wrapper that retries failed image downloads
-        # through the Wayback Machine (uses chapter timestamp if available)
+        # Use a fetch wrapper that handles Wayback fallback for failed
+        # images and compresses large animated GIF/WebP to first frame
         return self.utf8FromSoup(url, div,
-                                 fetch=self._make_wayback_image_fetch(wayback_ts))
+                                 fetch=self._make_image_fetch(wayback_ts))

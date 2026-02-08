@@ -18,6 +18,7 @@
 from __future__ import absolute_import
 import contextlib
 from datetime import datetime
+import json
 import logging
 import re
 from .. import exceptions as exceptions
@@ -59,6 +60,9 @@ class RoyalRoadAdapter(BaseSiteAdapter):
 
         # RR has globally unique ID for each chapter which can be used for fast lookup
         self.chapterURLIndex = {}
+
+        # Maps chapter_id -> wayback timestamp for chapters that need Wayback fetch
+        self.wayback_chapters = {}
 
     def make_date(self, parenttag):
         # locale dates differ but the timestamp is easily converted
@@ -190,6 +194,230 @@ class RoyalRoadAdapter(BaseSiteAdapter):
                     del inner['style']
                 #div.button.extract()
 
+    ## Wayback Machine helpers for recovering stubbed chapters
+
+    def _wayback_cdx_query(self, url_pattern):
+        """Query Wayback CDX API for archived snapshots matching url_pattern.
+        Returns list of [original_url, timestamp, statuscode] entries."""
+        cdx_url = (
+            'https://web.archive.org/cdx/search/cdx'
+            '?url=%s'
+            '&output=json'
+            '&fl=original,timestamp,statuscode'
+            '&filter=statuscode:200'
+            '&filter=!original:.*[%%3F].*'
+            '&collapse=urlkey'
+        ) % url_pattern
+        try:
+            data = self.get_request(cdx_url, usecache=False)
+            rows = json.loads(data)
+            if rows and rows[0] == ['original', 'timestamp', 'statuscode']:
+                return rows[1:]
+            return rows
+        except Exception as e:
+            logger.warning("Wayback CDX query failed for %s: %s" % (url_pattern, e))
+            return []
+
+    def _wayback_get_all_snapshots(self, story_id):
+        """Get all archived URLs for a story (ToC + chapters) in one CDX call.
+        Returns (toc_snapshots, chapter_snapshots) where:
+          toc_snapshots: list of (original_url, timestamp) for story ToC pages
+          chapter_snapshots: dict of chapter_id -> timestamp (most recent per chapter)
+        """
+        rows = self._wayback_cdx_query(
+            'www.royalroad.com/fiction/%s/*' % story_id
+        )
+
+        toc_snapshots = []
+        chapter_snapshots = {}
+        chap_id_pattern = re.compile(r'/chapter/(\d+)')
+        # Match only clean ToC URLs (slug after story ID, no query params)
+        toc_url_pattern = re.compile(
+            r'https?://(?:www\.)?royalroad\.com/fiction/\d+/[^/?]+$')
+
+        for row in rows:
+            original, timestamp, statuscode = row
+            chap_match = chap_id_pattern.search(original)
+            if chap_match:
+                chap_id = chap_match.group(1)
+                # Keep most recent timestamp per chapter
+                if chap_id not in chapter_snapshots or timestamp > chapter_snapshots[chap_id]:
+                    chapter_snapshots[chap_id] = timestamp
+            elif toc_url_pattern.match(original):
+                # Only consider clean ToC URLs (no ?review=, ?reviews=, etc.)
+                toc_snapshots.append((original, timestamp))
+
+        return toc_snapshots, chapter_snapshots
+
+    def _wayback_fetch_raw(self, url, timestamp):
+        """Fetch a page from Wayback using id_ modifier (raw, no toolbar)."""
+        wayback_url = 'https://web.archive.org/web/%sid_/%s' % (timestamp, url)
+        return self.get_request(wayback_url)
+
+    def _wayback_parse_toc(self, html_data):
+        """Parse an archived RR ToC page and return ordered list of chapter info.
+        Each entry: {'title': str, 'url': str, 'chapter_id': str}
+        """
+        soup = self.make_soup(html_data)
+        chapters_table = soup.find('table', {'id': 'chapters'})
+        if not chapters_table:
+            return []
+
+        tbody = chapters_table.find('tbody')
+        if not tbody:
+            return []
+
+        chap_pattern = re.compile(r'/chapter/(\d+)')
+        result = []
+        for tr in tbody.find_all('tr'):
+            tds = tr.find_all('td')
+            if len(tds) < 1:
+                continue
+            a_tag = tds[0].find('a')
+            if not a_tag or not a_tag.get('href'):
+                continue
+            href = a_tag['href']
+            chap_match = chap_pattern.search(href)
+            if not chap_match:
+                continue
+            chapter_id = chap_match.group(1)
+            title = a_tag.text.strip()
+            chapter_url = 'https://' + self.getSiteDomain() + href
+            entry = {
+                'title': title,
+                'url': chapter_url,
+                'chapter_id': chapter_id,
+            }
+            # Try to extract date from the second td
+            if len(tds) >= 2:
+                with contextlib.suppress(Exception):
+                    entry['date'] = self.make_date(tds[1])
+            result.append(entry)
+        return result
+
+    def _wayback_recover_stub_chapters(self):
+        """Recover missing chapters from Wayback Machine for a stubbed story.
+        Merges archived chapters with current ToC, storing Wayback timestamps
+        for chapters that need to be fetched from the archive."""
+        story_id = self.story.getMetadata('storyId')
+
+        logger.info("Story is stubbed, querying Wayback Machine for archived chapters...")
+
+        toc_snapshots, chapter_snapshots = self._wayback_get_all_snapshots(story_id)
+
+        if not chapter_snapshots and not toc_snapshots:
+            logger.warning("No Wayback Machine data found for story %s" % story_id)
+            return
+
+        # Collect current chapter IDs
+        current_chapter_ids = set(self.chapterURLIndex.keys())
+
+        # Find chapter IDs that exist in Wayback but not in current ToC
+        missing_chapter_ids = set(chapter_snapshots.keys()) - current_chapter_ids
+        if not missing_chapter_ids:
+            logger.info("No missing chapters found in Wayback archive")
+            return
+
+        logger.info("Found %d missing chapter(s) in Wayback archive" % len(missing_chapter_ids))
+
+        # Fetch an archived ToC that contains missing chapters.
+        # Try most recent snapshots first — accept the first one that contains
+        # at least some of the missing chapter IDs.
+        # toc_snapshots is list of (original_url, timestamp)
+        archived_toc_chapters = []
+        for toc_original_url, timestamp in sorted(toc_snapshots, key=lambda x: x[1], reverse=True):
+            try:
+                # Use the original URL from CDX (includes slug) so id_ fetch works
+                if not toc_original_url.startswith('http'):
+                    toc_original_url = 'https://' + toc_original_url
+                toc_data = self._wayback_fetch_raw(toc_original_url, timestamp)
+                parsed = self._wayback_parse_toc(toc_data)
+                if not parsed:
+                    continue
+                # Check if this ToC contains any of the missing chapters
+                parsed_ids = set(c['chapter_id'] for c in parsed)
+                found_missing = parsed_ids & missing_chapter_ids
+                if found_missing:
+                    archived_toc_chapters = parsed
+                    logger.debug("Using archived ToC from timestamp %s with %d chapters"
+                                 " (%d of %d missing chapters found)"
+                                 % (timestamp, len(parsed),
+                                    len(found_missing), len(missing_chapter_ids)))
+                    break
+                else:
+                    logger.debug("Skipping archived ToC at %s: %d chapters but"
+                                 " none are missing from current ToC"
+                                 % (timestamp, len(parsed)))
+            except Exception as e:
+                logger.debug("Failed to fetch archived ToC at %s: %s" % (timestamp, e))
+                continue
+
+        if not archived_toc_chapters:
+            # Fallback: no usable archived ToC. We have chapter IDs from CDX but no
+            # titles or ordering. Add them in chapter ID order with generic titles.
+            logger.warning("No archived ToC found; using chapter IDs from CDX index")
+            archived_toc_chapters = []
+            for chap_id in sorted(missing_chapter_ids, key=int):
+                archived_toc_chapters.append({
+                    'title': 'Chapter (Archived)',
+                    'url': 'https://%s/fiction/%s/chapter/%s' % (
+                        self.getSiteDomain(), story_id, chap_id),
+                    'chapter_id': chap_id,
+                })
+
+        # Build merged chapter list preserving archived order
+        # Walk through archived ToC order, using current version when available
+        date_format = self.getConfig("datechapter_format",
+                                     self.getConfig("datePublished_format", self.dateformat))
+
+        # Build a lookup of current chapters by their chapter_id
+        current_by_id = {}
+        for chap_id, idx in self.chapterURLIndex.items():
+            current_by_id[chap_id] = self.chapterUrls[idx]
+
+        # Track which current chapters we've placed in the merged list
+        placed_current_ids = set()
+        merged = []
+
+        for archived_chap in archived_toc_chapters:
+            chap_id = archived_chap['chapter_id']
+            if chap_id in current_by_id:
+                # Chapter still exists on the live site — use the current version
+                merged.append(current_by_id[chap_id])
+                placed_current_ids.add(chap_id)
+            elif chap_id in chapter_snapshots:
+                # Chapter was removed but exists in Wayback
+                chap_meta = {
+                    'title': archived_chap['title'],
+                    'url': archived_chap['url'],
+                }
+                if 'date' in archived_chap:
+                    chap_meta['date'] = archived_chap['date'].strftime(date_format)
+                self.wayback_chapters[chap_id] = chapter_snapshots[chap_id]
+                merged.append(chap_meta)
+
+        # Append any current chapters not found in the archived ToC
+        # (newer chapters added after archiving)
+        for chap_id in self.chapterURLIndex:
+            if chap_id not in placed_current_ids:
+                merged.append(current_by_id[chap_id])
+
+        # Replace chapter list and rebuild index
+        self.chapterUrls = merged
+        self.chapterURLIndex = {}
+        chap_pattern_long = re.compile(
+            r'https?://(?:www\.)?royalroadl?\.com/fiction/\d+/[^/]+/chapter/(\d+)/[^/]+/?$')
+        chap_pattern_short = re.compile(
+            r'https?://(?:www\.)?royalroadl?\.com/fiction/\d+/chapter/(\d+)/?$')
+        for i, chap in enumerate(self.chapterUrls):
+            match = chap_pattern_long.match(chap['url']) or chap_pattern_short.match(chap['url'])
+            if match:
+                self.chapterURLIndex[match.group(1)] = i
+        self.story.setMetadata('numChapters', self.num_chapters())
+
+        logger.info("Merged chapter list: %d total (%d from Wayback)"
+                     % (len(self.chapterUrls), len(self.wayback_chapters)))
+
     ## Getting the chapter list and the meta data, plus 'is adult' checking.
     def extractChapterUrlsAndMetadata(self):
 
@@ -301,16 +529,86 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             if m:
                 self.story.setMetadata('numWords',m.group('words'))
 
+        # Recover missing chapters from Wayback Machine for stubbed stories
+        if (self.story.getMetadata('status') == 'Stub'
+                and self.getConfig('use_wayback_for_stubs', False)):
+            try:
+                self._wayback_recover_stub_chapters()
+            except Exception as e:
+                logger.warning("Wayback Machine recovery failed: %s" % e)
+
+    def _wayback_get_chapter_timestamps(self, chapter_url):
+        """Get all archived timestamps for a specific chapter URL (newest first).
+        Used on-demand when we need to fall back to an older version."""
+        # Extract path pattern to match across slug variants
+        chap_match = re.search(r'/fiction/(\d+)/[^/]+/chapter/(\d+)', chapter_url)
+        if not chap_match:
+            return []
+        story_id, chapter_id = chap_match.group(1), chap_match.group(2)
+        # Query for all variants of this chapter URL
+        rows = self._wayback_cdx_query(
+            'www.royalroad.com/fiction/%s/*/chapter/%s/*' % (story_id, chapter_id)
+        )
+        # Collect unique timestamps, sorted newest first
+        timestamps = sorted(set(row[1] for row in rows), reverse=True)
+        return timestamps
+
+    def _wayback_fetch_best_chapter(self, url, newest_ts):
+        """Fetch chapter from Wayback using newest_ts. If the content looks
+        like a stub (less than 5% of an older version's content), falls back
+        to the older version."""
+        data = self._wayback_fetch_raw(url, newest_ts)
+        soup = self.make_soup(data)
+        div = soup.find('div', {'class': "chapter-inner chapter-content"})
+
+        # If content is suspiciously short (under ~500 words), check if an
+        # older archived version has substantially more content
+        if div:
+            newest_text = div.get_text()
+            newest_len = len(newest_text)
+            newest_words = len(newest_text.split())
+            if newest_words < 500:
+                all_timestamps = self._wayback_get_chapter_timestamps(url)
+                # Find timestamps older than the one we just fetched
+                older_timestamps = [ts for ts in all_timestamps if ts < newest_ts]
+                if older_timestamps:
+                    older_ts = older_timestamps[0]  # most recent older version
+                    try:
+                        older_data = self._wayback_fetch_raw(url, older_ts)
+                        older_soup = self.make_soup(older_data)
+                        older_div = older_soup.find('div', {'class': "chapter-inner chapter-content"})
+                        if older_div:
+                            older_len = len(older_div.get_text())
+                            if older_len > 0 and newest_len < older_len * 0.05:
+                                logger.info("Newest version (%s) has only %d chars"
+                                            " vs %d in older version (%s);"
+                                            " using older version"
+                                            % (newest_ts, newest_len,
+                                               older_len, older_ts))
+                                return older_soup
+                    except Exception:
+                        pass  # Older version failed, stick with newest
+
+        return soup
+
     # grab the text for an individual chapter.
     def getChapterText(self, url):
 
         logger.debug('Getting chapter text from: %s' % url)
 
-        ## httplib max headers removed Jan 2021--not seeing it
-        ## anymore, they probably fixed their site.  See
-        ## https://github.com/JimmXinu/FanFicFare/pull/174 for
-        ## original details.
-        soup = self.make_soup(self.get_request(url))
+        # Check if this chapter needs to be fetched from the Wayback Machine
+        chapter_id = None
+        chap_match = re.search(r'/chapter/(\d+)', url)
+        if chap_match:
+            chapter_id = chap_match.group(1)
+
+        if chapter_id and chapter_id in self.wayback_chapters:
+            timestamp = self.wayback_chapters[chapter_id]
+            logger.info("Fetching chapter %s from Wayback Machine (timestamp %s)"
+                        % (chapter_id, timestamp))
+            soup = self._wayback_fetch_best_chapter(url, timestamp)
+        else:
+            soup = self.make_soup(self.get_request(url))
 
         div = soup.find('div',{'class':"chapter-inner chapter-content"})
 

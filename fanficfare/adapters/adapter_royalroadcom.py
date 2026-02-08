@@ -98,7 +98,7 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             if getattr(img, 'is_animated', False):
                 img.seek(0)
                 if img.mode not in ('RGB', 'L'):
-                    img = img.convert('RGB')
+                    img = img.convert('RGBA').convert('RGB')
                 out = BytesIO()
                 img.save(out, 'JPEG', quality=85, optimize=True)
                 result = out.getvalue()

@@ -64,6 +64,79 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         # Maps chapter_id -> wayback timestamp for chapters that need Wayback fetch
         self.wayback_chapters = {}
 
+    def _make_wayback_image_fetch(self, timestamp=None):
+        """Create a fetch function that falls back to Wayback Machine on image failure.
+        If timestamp is provided, tries that snapshot first; then queries CDX
+        for other available snapshots, skipping redirect captures."""
+        original_fetch = self.get_request_raw
+        adapter = self
+        def wayback_fallback_fetch(url, **kwargs):
+            try:
+                return original_fetch(url, **kwargs)
+            except Exception:
+                if kwargs.get('image', False):
+                    logger.info("Image fetch failed for %s, trying Wayback Machine"
+                                % url)
+                    return adapter._wayback_fetch_image(url, timestamp)
+                raise
+        return wayback_fallback_fetch
+
+    def _is_wayback_redirect_capture(self, data):
+        """Check if Wayback response is a redirect capture page instead of
+        actual content (Wayback stores these when the original server
+        returned a 3xx redirect at crawl time)."""
+        if not data:
+            return True
+        check = data[:1000] if isinstance(data, str) else \
+            data[:1000].decode('utf-8', errors='ignore')
+        check = check.lower()
+        return 'got an http 30' in check and 'redirecting to' in check
+
+    def _wayback_fetch_image(self, url, preferred_ts=None):
+        """Fetch image from Wayback Machine, trying snapshots newest-first
+        and skipping any that are redirect captures."""
+        # Build ordered list of timestamps to try (preferred first)
+        timestamps = []
+        if preferred_ts:
+            timestamps.append(preferred_ts)
+
+        # Query CDX for available snapshots with actual content (status 200)
+        try:
+            cdx_url = ('https://web.archive.org/cdx/search/cdx'
+                       '?url=%s'
+                       '&output=json'
+                       '&fl=timestamp,statuscode'
+                       '&filter=statuscode:200') % url
+            resp = self.get_request(cdx_url)
+            rows = json.loads(resp)
+            if rows and isinstance(rows[0], list) and rows[0][0] == 'timestamp':
+                rows = rows[1:]
+            # Add timestamps newest-first, skip any already queued
+            seen = set(timestamps)
+            for row in reversed(rows):
+                ts = row[0]
+                if ts not in seen:
+                    timestamps.append(ts)
+                    seen.add(ts)
+        except Exception as e:
+            logger.debug("CDX query for image %s failed: %s" % (url, e))
+
+        # Try up to 5 snapshots
+        for ts in timestamps[:5]:
+            try:
+                wayback_url = 'https://web.archive.org/web/%sid_/%s' % (ts, url)
+                data = self.get_request_raw(wayback_url, image=True)
+                if not self._is_wayback_redirect_capture(data):
+                    logger.info("Found image in Wayback at timestamp %s: %s"
+                                % (ts, url))
+                    return data
+                logger.debug("Wayback snapshot %s for %s was a redirect capture,"
+                             " trying next" % (ts, url))
+            except Exception:
+                continue
+
+        raise Exception("No working Wayback snapshot found for image: %s" % url)
+
     def make_date(self, parenttag):
         # locale dates differ but the timestamp is easily converted
         timetag = parenttag.find('time')
@@ -598,15 +671,16 @@ class RoyalRoadAdapter(BaseSiteAdapter):
 
         # Check if this chapter needs to be fetched from the Wayback Machine
         chapter_id = None
+        wayback_ts = None
         chap_match = re.search(r'/chapter/(\d+)', url)
         if chap_match:
             chapter_id = chap_match.group(1)
 
         if chapter_id and chapter_id in self.wayback_chapters:
-            timestamp = self.wayback_chapters[chapter_id]
+            wayback_ts = self.wayback_chapters[chapter_id]
             logger.info("Fetching chapter %s from Wayback Machine (timestamp %s)"
-                        % (chapter_id, timestamp))
-            soup = self._wayback_fetch_best_chapter(url, timestamp)
+                        % (chapter_id, wayback_ts))
+            soup = self._wayback_fetch_best_chapter(url, wayback_ts)
         else:
             soup = self.make_soup(self.get_request(url))
 
@@ -635,4 +709,8 @@ class RoyalRoadAdapter(BaseSiteAdapter):
 
         for element in div.find_all(has_display_none_style):
             element.extract()
-        return self.utf8FromSoup(url,div)
+
+        # Use a fetch wrapper that retries failed image downloads
+        # through the Wayback Machine (uses chapter timestamp if available)
+        return self.utf8FromSoup(url, div,
+                                 fetch=self._make_wayback_image_fetch(wayback_ts))

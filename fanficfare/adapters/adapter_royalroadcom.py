@@ -335,11 +335,45 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             logger.warning("Wayback CDX query failed for %s: %s" % (url_pattern, e))
             return []
 
+    def _wayback_get_chapter_title(self, url, timestamp):
+        """Fetch an archived chapter page and extract the title from the <h1> tag."""
+        try:
+            data = self._wayback_fetch_raw(url, timestamp)
+            soup = self.make_soup(data)
+            h1 = soup.find('h1')
+            if h1:
+                title = h1.get_text(strip=True)
+                if title:
+                    return title
+        except Exception as e:
+            logger.debug("Failed to get title from %s: %s" % (url, e))
+        return None
+
+    @staticmethod
+    def _title_from_wayback_url(url):
+        """Fallback: extract a chapter title from a URL slug.
+        E.g. '.../chapter/1234/101-eat-or-be-eaten' -> '101 - Eat or Be Eaten'"""
+        slug_match = re.search(r'/chapter/\d+/(.+?)/?$', url)
+        if not slug_match:
+            return 'Chapter (Archived)'
+        slug = slug_match.group(1)
+        try:
+            from urllib.parse import unquote
+            slug = unquote(slug)
+        except Exception:
+            pass
+        title = slug.replace('-', ' ').strip()
+        parts = title.split(' ', 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            return '%s - %s' % (parts[0], parts[1].title())
+        return title.title()
+
     def _wayback_get_all_snapshots(self, story_id):
         """Get all archived URLs for a story (ToC + chapters) in one CDX call.
         Returns (toc_snapshots, chapter_snapshots) where:
           toc_snapshots: list of (original_url, timestamp) for story ToC pages
-          chapter_snapshots: dict of chapter_id -> timestamp (most recent per chapter)
+          chapter_snapshots: dict of chapter_id -> (timestamp, original_url)
+            (most recent per chapter)
         """
         rows = self._wayback_cdx_query(
             'www.royalroad.com/fiction/%s/*' % story_id
@@ -347,7 +381,8 @@ class RoyalRoadAdapter(BaseSiteAdapter):
 
         toc_snapshots = []
         chapter_snapshots = {}
-        chap_id_pattern = re.compile(r'/chapter/(\d+)')
+        # Match chapter URLs with a valid slug (must contain letters)
+        chap_id_pattern = re.compile(r'/chapter/(\d+)/[^/?]*[a-zA-Z][^/?]*$')
         # Match only clean ToC URLs (slug after story ID, no query params)
         toc_url_pattern = re.compile(
             r'https?://(?:www\.)?royalroad\.com/fiction/\d+/[^/?]+$')
@@ -358,8 +393,8 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             if chap_match:
                 chap_id = chap_match.group(1)
                 # Keep most recent timestamp per chapter
-                if chap_id not in chapter_snapshots or timestamp > chapter_snapshots[chap_id]:
-                    chapter_snapshots[chap_id] = timestamp
+                if chap_id not in chapter_snapshots or timestamp > chapter_snapshots[chap_id][0]:
+                    chapter_snapshots[chap_id] = (timestamp, original)
             elif toc_url_pattern.match(original):
                 # Only consider clean ToC URLs (no ?review=, ?reviews=, etc.)
                 toc_snapshots.append((original, timestamp))
@@ -470,15 +505,24 @@ class RoyalRoadAdapter(BaseSiteAdapter):
                 continue
 
         if not archived_toc_chapters:
-            # Fallback: no usable archived ToC. We have chapter IDs from CDX but no
-            # titles or ordering. Add them in chapter ID order with generic titles.
-            logger.warning("No archived ToC found; using chapter IDs from CDX index")
+            # Fallback: no usable archived ToC. Fetch titles from chapter pages.
+            logger.warning("No archived ToC found; fetching titles from chapter pages")
             archived_toc_chapters = []
             for chap_id in sorted(missing_chapter_ids, key=int):
+                if chap_id in chapter_snapshots:
+                    _ts, orig_url = chapter_snapshots[chap_id]
+                    chap_url = orig_url if orig_url.startswith('http') else \
+                               'https://' + orig_url
+                    title = self._wayback_get_chapter_title(chap_url, _ts)
+                    if not title:
+                        title = self._title_from_wayback_url(orig_url)
+                else:
+                    title = 'Chapter (Archived)'
+                    chap_url = 'https://%s/fiction/%s/chapter/%s' % (
+                        self.getSiteDomain(), story_id, chap_id)
                 archived_toc_chapters.append({
-                    'title': 'Chapter (Archived)',
-                    'url': 'https://%s/fiction/%s/chapter/%s' % (
-                        self.getSiteDomain(), story_id, chap_id),
+                    'title': title,
+                    'url': chap_url,
                     'chapter_id': chap_id,
                 })
 
@@ -496,6 +540,7 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         placed_current_ids = set()
         merged = []
 
+        placed_wayback_ids = set()
         for archived_chap in archived_toc_chapters:
             chap_id = archived_chap['chapter_id']
             if chap_id in current_by_id:
@@ -510,8 +555,62 @@ class RoyalRoadAdapter(BaseSiteAdapter):
                 }
                 if 'date' in archived_chap:
                     chap_meta['date'] = archived_chap['date'].strftime(date_format)
-                self.wayback_chapters[chap_id] = chapter_snapshots[chap_id]
+                ts, _orig_url = chapter_snapshots[chap_id]
+                self.wayback_chapters[chap_id] = ts
                 merged.append(chap_meta)
+                placed_wayback_ids.add(chap_id)
+
+        # Add missing chapters not found in any archived ToC.
+        # Fetch each chapter page to get the real title from <h1>.
+        unplaced_missing = sorted(
+            missing_chapter_ids - placed_wayback_ids, key=int)
+        if unplaced_missing:
+            logger.info("%d missing chapter(s) not in any archived ToC,"
+                        " fetching titles from chapter pages"
+                        % len(unplaced_missing))
+            extra_chapters = []
+            for chap_id in unplaced_missing:
+                if chap_id not in chapter_snapshots:
+                    continue
+                ts, orig_url = chapter_snapshots[chap_id]
+                chap_url = orig_url if orig_url.startswith('http') else \
+                           'https://' + orig_url
+                # Try to get real title from the archived chapter page
+                title = self._wayback_get_chapter_title(chap_url, ts)
+                if not title:
+                    title = self._title_from_wayback_url(orig_url)
+                chap_meta = {
+                    'title': title,
+                    'url': chap_url,
+                }
+                self.wayback_chapters[chap_id] = ts
+                extra_chapters.append(chap_meta)
+
+            # Insert extra chapters in correct position by chapter ID.
+            # Build a map of chapter_id -> position for the merged list,
+            # then interleave extra chapters based on ID ordering.
+            if extra_chapters and merged:
+                # Get chapter IDs for each position in merged list
+                chap_id_re = re.compile(r'/chapter/(\d+)')
+                merged_ids = []
+                for chap in merged:
+                    m = chap_id_re.search(chap['url'])
+                    merged_ids.append(int(m.group(1)) if m else 0)
+
+                # Insert each extra chapter before the first merged chapter
+                # with a higher ID
+                for extra in reversed(extra_chapters):
+                    m = chap_id_re.search(extra['url'])
+                    extra_id = int(m.group(1)) if m else 0
+                    insert_pos = len(merged)
+                    for i, mid in enumerate(merged_ids):
+                        if mid > extra_id:
+                            insert_pos = i
+                            break
+                    merged.insert(insert_pos, extra)
+                    merged_ids.insert(insert_pos, extra_id)
+            else:
+                merged.extend(extra_chapters)
 
         # Append any current chapters not found in the archived ToC
         # (newer chapters added after archiving)

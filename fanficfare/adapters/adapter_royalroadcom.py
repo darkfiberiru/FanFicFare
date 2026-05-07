@@ -61,7 +61,11 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         # RR has globally unique ID for each chapter which can be used for fast lookup
         self.chapterURLIndex = {}
 
-        # Maps chapter_id -> wayback timestamp for chapters that need Wayback fetch
+        # Maps chapter_id -> (wayback timestamp, archived original URL) for
+        # chapters that need to be fetched from the Wayback Machine. The
+        # archived URL is preserved separately because the slug stored in
+        # chapterUrls (taken from an archived ToC) may differ from the slug
+        # under which the chapter itself was archived.
         self.wayback_chapters = {}
 
     def _make_image_fetch(self, wayback_ts=None):
@@ -111,7 +115,7 @@ class RoyalRoadAdapter(BaseSiteAdapter):
 
             # Static image over 1MB: compress to JPEG
             if img.mode not in ('RGB', 'L'):
-                img = img.convert('RGB')
+                img = img.convert('RGBA').convert('RGB')
             out = BytesIO()
             img.save(out, 'JPEG', quality=75, optimize=True)
             result = out.getvalue()
@@ -313,6 +317,13 @@ class RoyalRoadAdapter(BaseSiteAdapter):
 
     ## Wayback Machine helpers for recovering stubbed chapters
 
+    @staticmethod
+    def _ensure_https(url):
+        """Ensure URL has https:// scheme."""
+        if not url.startswith('http'):
+            return 'https://' + url
+        return url
+
     def _wayback_cdx_query(self, url_pattern):
         """Query Wayback CDX API for archived snapshots matching url_pattern.
         Returns list of [original_url, timestamp, statuscode] entries."""
@@ -357,11 +368,8 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         if not slug_match:
             return 'Chapter (Archived)'
         slug = slug_match.group(1)
-        try:
-            from urllib.parse import unquote
-            slug = unquote(slug)
-        except Exception:
-            pass
+        from urllib.parse import unquote
+        slug = unquote(slug)
         title = slug.replace('-', ' ').strip()
         parts = title.split(' ', 1)
         if len(parts) == 2 and parts[0].isdigit():
@@ -381,11 +389,14 @@ class RoyalRoadAdapter(BaseSiteAdapter):
 
         toc_snapshots = []
         chapter_snapshots = {}
-        # Match chapter URLs with a valid slug (must contain letters)
-        chap_id_pattern = re.compile(r'/chapter/(\d+)/[^/?]*[a-zA-Z][^/?]*$')
+        # Match chapter URLs with a valid slug. RR slugs are alphanumerics
+        # and dashes only — anything else (e.g. percent-encoded chars from
+        # broken referrer crawls) means the URL is junk and the archived
+        # page is typically a 403/error page.
+        chap_id_pattern = re.compile(r'/chapter/(\d+)/[a-zA-Z0-9][a-zA-Z0-9-]*$')
         # Match only clean ToC URLs (slug after story ID, no query params)
         toc_url_pattern = re.compile(
-            r'https?://(?:www\.)?royalroad\.com/fiction/\d+/[^/?]+$')
+            r'https?://(?:www\.)?royalroad\.com/fiction/\d+/[a-zA-Z0-9][a-zA-Z0-9-]*$')
 
         for row in rows:
             original, timestamp, statuscode = row
@@ -480,8 +491,7 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         for toc_original_url, timestamp in sorted(toc_snapshots, key=lambda x: x[1], reverse=True):
             try:
                 # Use the original URL from CDX (includes slug) so id_ fetch works
-                if not toc_original_url.startswith('http'):
-                    toc_original_url = 'https://' + toc_original_url
+                toc_original_url = self._ensure_https(toc_original_url)
                 toc_data = self._wayback_fetch_raw(toc_original_url, timestamp)
                 parsed = self._wayback_parse_toc(toc_data)
                 if not parsed:
@@ -511,8 +521,7 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             for chap_id in sorted(missing_chapter_ids, key=int):
                 if chap_id in chapter_snapshots:
                     _ts, orig_url = chapter_snapshots[chap_id]
-                    chap_url = orig_url if orig_url.startswith('http') else \
-                               'https://' + orig_url
+                    chap_url = self._ensure_https(orig_url)
                     title = self._wayback_get_chapter_title(chap_url, _ts)
                     if not title:
                         title = self._title_from_wayback_url(orig_url)
@@ -555,8 +564,8 @@ class RoyalRoadAdapter(BaseSiteAdapter):
                 }
                 if 'date' in archived_chap:
                     chap_meta['date'] = archived_chap['date'].strftime(date_format)
-                ts, _orig_url = chapter_snapshots[chap_id]
-                self.wayback_chapters[chap_id] = ts
+                ts, orig_url = chapter_snapshots[chap_id]
+                self.wayback_chapters[chap_id] = (ts, self._ensure_https(orig_url))
                 merged.append(chap_meta)
                 placed_wayback_ids.add(chap_id)
 
@@ -573,8 +582,7 @@ class RoyalRoadAdapter(BaseSiteAdapter):
                 if chap_id not in chapter_snapshots:
                     continue
                 ts, orig_url = chapter_snapshots[chap_id]
-                chap_url = orig_url if orig_url.startswith('http') else \
-                           'https://' + orig_url
+                chap_url = self._ensure_https(orig_url)
                 # Try to get real title from the archived chapter page
                 title = self._wayback_get_chapter_title(chap_url, ts)
                 if not title:
@@ -583,7 +591,7 @@ class RoyalRoadAdapter(BaseSiteAdapter):
                     'title': title,
                     'url': chap_url,
                 }
-                self.wayback_chapters[chap_id] = ts
+                self.wayback_chapters[chap_id] = (ts, chap_url)
                 extra_chapters.append(chap_meta)
 
             # Insert extra chapters in correct position by chapter ID.
@@ -774,6 +782,25 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         like a stub (less than 5% of an older version's content), falls back
         to the older version."""
         data = self._wayback_fetch_raw(url, newest_ts)
+
+        # If Wayback returned a redirect capture page, skip to older versions
+        if self._is_wayback_redirect_capture(data):
+            logger.debug("Newest Wayback snapshot (%s) for chapter is a redirect"
+                         " capture, trying older versions" % newest_ts)
+            all_timestamps = self._wayback_get_chapter_timestamps(url)
+            for ts in all_timestamps:
+                if ts >= newest_ts:
+                    continue
+                try:
+                    data = self._wayback_fetch_raw(url, ts)
+                    if not self._is_wayback_redirect_capture(data):
+                        logger.info("Using older Wayback snapshot (%s) for chapter"
+                                    % ts)
+                        newest_ts = ts
+                        break
+                except Exception:
+                    continue
+
         soup = self.make_soup(data)
         div = soup.find('div', {'class': "chapter-inner chapter-content"})
 
@@ -820,10 +847,13 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             chapter_id = chap_match.group(1)
 
         if chapter_id and chapter_id in self.wayback_chapters:
-            wayback_ts = self.wayback_chapters[chapter_id]
+            wayback_ts, archived_url = self.wayback_chapters[chapter_id]
             logger.info("Fetching chapter %s from Wayback Machine (timestamp %s)"
                         % (chapter_id, wayback_ts))
-            soup = self._wayback_fetch_best_chapter(url, wayback_ts)
+            # archived_url may use a different slug than the URL stored in
+            # chapterUrls (which can come from an archived ToC) — the
+            # chapter itself was only ever archived under archived_url.
+            soup = self._wayback_fetch_best_chapter(archived_url, wayback_ts)
         else:
             soup = self.make_soup(self.get_request(url))
 

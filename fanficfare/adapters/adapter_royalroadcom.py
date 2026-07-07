@@ -324,9 +324,12 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             return 'https://' + url
         return url
 
-    def _wayback_cdx_query(self, url_pattern):
+    def _wayback_cdx_query(self, url_pattern, extra_filter=None, collapse=True):
         """Query Wayback CDX API for archived snapshots matching url_pattern.
-        Returns list of [original_url, timestamp, statuscode] entries."""
+        Returns list of [original_url, timestamp, statuscode] entries.
+        extra_filter: additional CDX filter expression, e.g. a positive
+        regex on the original URL. collapse=False returns every capture
+        instead of one per unique URL."""
         cdx_url = (
             'https://web.archive.org/cdx/search/cdx'
             '?url=%s'
@@ -334,8 +337,11 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             '&fl=original,timestamp,statuscode'
             '&filter=statuscode:200'
             '&filter=!original:.*[%%3F].*'
-            '&collapse=urlkey'
         ) % url_pattern
+        if extra_filter:
+            cdx_url += '&filter=' + extra_filter
+        if collapse:
+            cdx_url += '&collapse=urlkey'
         try:
             data = self.get_request(cdx_url, usecache=False)
             rows = json.loads(data)
@@ -346,18 +352,45 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             logger.warning("Wayback CDX query failed for %s: %s" % (url_pattern, e))
             return []
 
-    def _wayback_get_chapter_title(self, url, timestamp):
-        """Fetch an archived chapter page and extract the title from the <h1> tag."""
+    def _wayback_probe_chapter(self, url, timestamp):
+        """Fetch an archived chapter page and return (has_content, title).
+        has_content is False for redirect captures and for pages without a
+        chapter content div — e.g. RR's "Forbidden" page for a chapter the
+        author deleted, which RR serves with HTTP 200 so Wayback archives
+        it as a 200 capture."""
         try:
             data = self._wayback_fetch_raw(url, timestamp)
+            if self._is_wayback_redirect_capture(data):
+                return False, None
             soup = self.make_soup(data)
+            div = soup.find('div', {'class': 'chapter-inner chapter-content'})
+            title = None
             h1 = soup.find('h1')
             if h1:
-                title = h1.get_text(strip=True)
-                if title:
-                    return title
+                title = h1.get_text(strip=True) or None
+            return (div is not None), title
         except Exception as e:
-            logger.debug("Failed to get title from %s: %s" % (url, e))
+            logger.debug("Failed to probe archived chapter %s: %s" % (url, e))
+            return False, None
+
+    def _wayback_resolve_missing_chapter(self, chap_id, chapter_snapshots):
+        """Find an archived capture of chap_id that actually contains
+        chapter content, trying the newest capture first then older ones.
+        Returns (timestamp, url, title), or None if no capture has content
+        (typically a chapter deleted from the site whose only captures are
+        RR's "Forbidden" error page)."""
+        ts, orig_url = chapter_snapshots[chap_id]
+        chap_url = self._ensure_https(orig_url)
+        has_content, title = self._wayback_probe_chapter(chap_url, ts)
+        if has_content:
+            return ts, chap_url, title
+        for older_ts, snap_url in self._wayback_get_chapter_snapshots(chap_url):
+            if older_ts >= ts:
+                continue
+            snap_url = self._ensure_https(snap_url)
+            has_content, title = self._wayback_probe_chapter(snap_url, older_ts)
+            if has_content:
+                return older_ts, snap_url, title
         return None
 
     @staticmethod
@@ -519,16 +552,22 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             logger.warning("No archived ToC found; fetching titles from chapter pages")
             archived_toc_chapters = []
             for chap_id in sorted(missing_chapter_ids, key=int):
-                if chap_id in chapter_snapshots:
-                    _ts, orig_url = chapter_snapshots[chap_id]
-                    chap_url = self._ensure_https(orig_url)
-                    title = self._wayback_get_chapter_title(chap_url, _ts)
-                    if not title:
-                        title = self._title_from_wayback_url(orig_url)
-                else:
-                    title = 'Chapter (Archived)'
-                    chap_url = 'https://%s/fiction/%s/chapter/%s' % (
-                        self.getSiteDomain(), story_id, chap_id)
+                if chap_id not in chapter_snapshots:
+                    continue
+                resolved = self._wayback_resolve_missing_chapter(
+                    chap_id, chapter_snapshots)
+                if not resolved:
+                    logger.warning("Skipping missing chapter %s: no archived"
+                                   " capture contains chapter content"
+                                   " (chapter deleted from site?)" % chap_id)
+                    del chapter_snapshots[chap_id]
+                    continue
+                ts, chap_url, title = resolved
+                # Point at the capture that actually has content so the
+                # download step doesn't refetch a dead capture.
+                chapter_snapshots[chap_id] = (ts, chap_url)
+                if not title:
+                    title = self._title_from_wayback_url(chap_url)
                 archived_toc_chapters.append({
                     'title': title,
                     'url': chap_url,
@@ -581,12 +620,16 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             for chap_id in unplaced_missing:
                 if chap_id not in chapter_snapshots:
                     continue
-                ts, orig_url = chapter_snapshots[chap_id]
-                chap_url = self._ensure_https(orig_url)
-                # Try to get real title from the archived chapter page
-                title = self._wayback_get_chapter_title(chap_url, ts)
+                resolved = self._wayback_resolve_missing_chapter(
+                    chap_id, chapter_snapshots)
+                if not resolved:
+                    logger.warning("Skipping missing chapter %s: no archived"
+                                   " capture contains chapter content"
+                                   " (chapter deleted from site?)" % chap_id)
+                    continue
+                ts, chap_url, title = resolved
                 if not title:
-                    title = self._title_from_wayback_url(orig_url)
+                    title = self._title_from_wayback_url(chap_url)
                 chap_meta = {
                     'title': title,
                     'url': chap_url,
@@ -761,48 +804,59 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             except Exception as e:
                 logger.warning("Wayback Machine recovery failed: %s" % e)
 
-    def _wayback_get_chapter_timestamps(self, chapter_url):
-        """Get all archived timestamps for a specific chapter URL (newest first).
+    def _wayback_get_chapter_snapshots(self, chapter_url):
+        """Get all archived captures for a specific chapter (newest first),
+        as (timestamp, original_url) pairs. Matches across slug variants.
         Used on-demand when we need to fall back to an older version."""
-        # Extract path pattern to match across slug variants
         chap_match = re.search(r'/fiction/(\d+)/[^/]+/chapter/(\d+)', chapter_url)
         if not chap_match:
             return []
         story_id, chapter_id = chap_match.group(1), chap_match.group(2)
-        # Query for all variants of this chapter URL
+        # CDX only supports prefix wildcards (a mid-URL '*' matches
+        # nothing), so query the whole story and filter server-side for
+        # this chapter's captures across all slug variants.
         rows = self._wayback_cdx_query(
-            'www.royalroad.com/fiction/%s/*/chapter/%s/*' % (story_id, chapter_id)
-        )
-        # Collect unique timestamps, sorted newest first
-        timestamps = sorted(set(row[1] for row in rows), reverse=True)
-        return timestamps
+            'www.royalroad.com/fiction/%s/*' % story_id,
+            extra_filter='original:.*/chapter/%s/.*' % chapter_id,
+            collapse=False)
+        # (timestamp, original_url) pairs, newest first, so a fallback
+        # fetch uses the URL the capture was actually archived under.
+        snapshots = sorted(set((row[1], row[0]) for row in rows), reverse=True)
+        return snapshots
 
     def _wayback_fetch_best_chapter(self, url, newest_ts):
         """Fetch chapter from Wayback using newest_ts. If the content looks
         like a stub (less than 5% of an older version's content), falls back
         to the older version."""
         data = self._wayback_fetch_raw(url, newest_ts)
+        soup = self.make_soup(data)
+        div = soup.find('div', {'class': "chapter-inner chapter-content"})
 
-        # If Wayback returned a redirect capture page, skip to older versions
-        if self._is_wayback_redirect_capture(data):
-            logger.debug("Newest Wayback snapshot (%s) for chapter is a redirect"
-                         " capture, trying older versions" % newest_ts)
-            all_timestamps = self._wayback_get_chapter_timestamps(url)
-            for ts in all_timestamps:
+        # A redirect capture, or a capture with no content div (e.g. RR's
+        # "Forbidden" page for a deleted chapter, which RR serves with
+        # HTTP 200 and Wayback archives as a 200), is useless — fall back
+        # to older snapshots.
+        if self._is_wayback_redirect_capture(data) or div is None:
+            logger.debug("Newest Wayback snapshot (%s) for chapter has no"
+                         " usable content, trying older versions" % newest_ts)
+            for ts, snap_url in self._wayback_get_chapter_snapshots(url):
                 if ts >= newest_ts:
                     continue
                 try:
-                    data = self._wayback_fetch_raw(url, ts)
-                    if not self._is_wayback_redirect_capture(data):
-                        logger.info("Using older Wayback snapshot (%s) for chapter"
-                                    % ts)
-                        newest_ts = ts
-                        break
+                    cand_data = self._wayback_fetch_raw(
+                        self._ensure_https(snap_url), ts)
                 except Exception:
                     continue
-
-        soup = self.make_soup(data)
-        div = soup.find('div', {'class': "chapter-inner chapter-content"})
+                if self._is_wayback_redirect_capture(cand_data):
+                    continue
+                cand_soup = self.make_soup(cand_data)
+                cand_div = cand_soup.find('div', {'class': "chapter-inner chapter-content"})
+                if cand_div is None:
+                    continue
+                logger.info("Using older Wayback snapshot (%s) for chapter"
+                            % ts)
+                soup, div, newest_ts = cand_soup, cand_div, ts
+                break
 
         # If content is suspiciously short (under ~500 words), check if an
         # older archived version has substantially more content
@@ -811,13 +865,15 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             newest_len = len(newest_text)
             newest_words = len(newest_text.split())
             if newest_words < 500:
-                all_timestamps = self._wayback_get_chapter_timestamps(url)
-                # Find timestamps older than the one we just fetched
-                older_timestamps = [ts for ts in all_timestamps if ts < newest_ts]
-                if older_timestamps:
-                    older_ts = older_timestamps[0]  # most recent older version
+                all_snapshots = self._wayback_get_chapter_snapshots(url)
+                # Find captures older than the one we just fetched
+                older_snapshots = [(ts, u) for ts, u in all_snapshots
+                                   if ts < newest_ts]
+                if older_snapshots:
+                    older_ts, older_url = older_snapshots[0]  # most recent older version
                     try:
-                        older_data = self._wayback_fetch_raw(url, older_ts)
+                        older_data = self._wayback_fetch_raw(
+                            self._ensure_https(older_url), older_ts)
                         older_soup = self.make_soup(older_data)
                         older_div = older_soup.find('div', {'class': "chapter-inner chapter-content"})
                         if older_div:
@@ -863,6 +919,17 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         # defaults.ini output CSS now outlines/pads the tables, at least.
 
         if None == div:
+            if wayback_ts:
+                # Wayback-recovery chapter with no recoverable content in
+                # any capture (e.g. deleted from RR before it was ever
+                # crawled with content) — insert a placeholder rather than
+                # aborting the whole download.
+                logger.warning("No archived capture of chapter %s contains"
+                               " content; inserting placeholder" % url)
+                return ('<div><p><i>(Chapter content unavailable: this'
+                        ' chapter was removed from Royal Road and no'
+                        ' Wayback Machine capture of it contains its'
+                        ' content.)</i></p></div>')
             raise exceptions.FailedToDownload("Error downloading Chapter: %s!  Missing required element!" % url)
 
         if self.getConfig("include_author_notes",True):

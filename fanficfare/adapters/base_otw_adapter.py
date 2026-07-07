@@ -131,7 +131,13 @@ class BaseOTWAdapter(BaseSiteAdapter):
         params['utf8'] = u'\x2713' # utf8 *is* required now.  hex code works better than actual character for some reason. u'✓'
 
         # authenticity_token now comes from a completely separate json call.
-        token_json = json.loads(self.get_request('https://' + self.getSiteDomain() + "/token_dispenser.json"))
+        json_data = None
+        try:
+            json_data = self.get_request('https://' + self.getSiteDomain() + "/token_dispenser.json")
+            token_json = json.loads(json_data)
+        except:
+            logger.debug("token_dispenser.json FAILED returned: %s"%json_data)
+            raise exceptions.FailedToDownload('Failed getting login token from token_dispenser.json')
         params['authenticity_token'] = token_json['token']
 
         loginUrl = 'https://' + self.getSiteDomain() + '/users/login'
@@ -545,7 +551,7 @@ class BaseOTWAdapter(BaseSiteAdapter):
                 ulassoc = headnotes.find('ul', {'class' : "associations"})
                 headnotes = headnotes.find('blockquote', {'class' : "userstuff"})
                 if headnotes != None or ulassoc != None:
-                    append_tag(head_notes_div,'b',"Author's Note:")
+                    append_tag(head_notes_div,'b',self.getConfig("notelabel_authorheadnotes","Author's Note:"))
                 if ulassoc != None:
                     # fix relative links--all examples so far have been.
                     for alink in ulassoc.find_all('a'):
@@ -560,7 +566,7 @@ class BaseOTWAdapter(BaseSiteAdapter):
             chapsumm = chapter_dl_soup.find('div', {'id' : "summary"})
             if chapsumm != None:
                 chapsumm = chapsumm.find('blockquote')
-                append_tag(head_notes_div,'b',"Summary for the Chapter:")
+                append_tag(head_notes_div,'b',self.getConfig("notelabel_chaptersummary","Summary for the Chapter:"))
                 head_notes_div.append(chapsumm)
 
         ## Can appear on every chapter
@@ -569,7 +575,7 @@ class BaseOTWAdapter(BaseSiteAdapter):
             if chapnotes != None:
                 chapnotes = chapnotes.find('blockquote')
                 if chapnotes != None:
-                    append_tag(head_notes_div,'b',"Notes for the Chapter:")
+                    append_tag(head_notes_div,'b',self.getConfig("notelabel_chapterheadnotes","Notes for the Chapter:"))
                     head_notes_div.append(chapnotes)
 
         text = chapter_dl_soup.find('div', {'class' : "userstuff module"})
@@ -584,7 +590,7 @@ class BaseOTWAdapter(BaseSiteAdapter):
             chapfoot = chapter_dl_soup.find('div', {'class' : "end notes module"})
             if chapfoot != None:
                 chapfoot = chapfoot.find('blockquote')
-                append_tag(foot_notes_div,'b',"Notes for the Chapter:")
+                append_tag(foot_notes_div,'b',self.getConfig("notelabel_chapterfootnotes","Notes for the Chapter:"))
                 foot_notes_div.append(chapfoot)
 
         skip_on_update_tags = []
@@ -598,7 +604,7 @@ class BaseOTWAdapter(BaseSiteAdapter):
             if footnotes != None:
                 footnotes = footnotes.find('blockquote')
                 if footnotes:
-                    b = append_tag(foot_notes_div,'b',"Author's Note:")
+                    b = append_tag(foot_notes_div,'b',self.getConfig("notelabel_authorfootnotes","Author's Note:"))
                     skip_on_update_tags.append(b)
                     skip_on_update_tags.append(footnotes)
                     foot_notes_div.append(footnotes)
@@ -702,7 +708,7 @@ class BaseOTWAdapter(BaseSiteAdapter):
                 retval['urllist']=urllist
             else:
                 retval['urllist']=[ 'https://'+self.host+a['href'] for a in soup.select('h4.heading a:first-child') ]
-            retval['name']=stripHTML(soup.select_one("h2.heading"))
+            retval['name']=stripHTML(soup.select_one("div.series-show h2.heading"))
             desc=soup.select_one("div.wrapper dd blockquote.userstuff")
             if desc:
                 desc.name='div' # change blockquote to div to match stories.

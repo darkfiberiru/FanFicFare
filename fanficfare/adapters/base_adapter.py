@@ -24,7 +24,7 @@ from collections import defaultdict
 # py2 vs py3 transition
 from ..six import text_type as unicode
 from ..six import string_types as basestring
-from ..six.moves.urllib.parse import urlparse, parse_qs, urlunparse
+from ..six.moves.urllib.parse import urlparse, parse_qs, urljoin
 
 import logging
 from functools import partial
@@ -282,6 +282,8 @@ class BaseSiteAdapter(Requestable):
                             if( self.getConfig('continue_on_chapter_error') and
                                 continue_on_chapter_error_try_limit > 0 and # for -1 == infinite
                                 self.story.chapter_error_count >= continue_on_chapter_error_try_limit ):
+                                logger.info("continue_on_chapter_error: (%s) continue_on_chapter_error_try_limit(%s) exceeded"%(url,continue_on_chapter_error_try_limit))
+                                self.story.chapter_error_count += 1
                                 data, title, url = do_error_chapter("""<div>
 <p><b>Error</b></p>
 <p>FanFicFare didn't try to download this chapter, due to earlier chapter errors.</p><p>
@@ -303,6 +305,9 @@ try to download.</p>
                             newchap = False
                     except Exception as e:
                         if self.getConfig('continue_on_chapter_error',False):
+                            logger.info("continue_on_chapter_error: (%s) %s"%(url,e))
+                            logger.debug(traceback.format_exc())
+                            self.story.chapter_error_count += 1
                             data, title, url = do_error_chapter("""<div>
 <p><b>Error</b></p>
 <p>FanFicFare failed to download this chapter.  Because
@@ -310,9 +315,6 @@ try to download.</p>
 <p>Chapter URL:<br><a href="%s">%s</a></p>
 <p>Error:<br><pre>%s</pre></p>
 </div>"""%(url,url,traceback.format_exc().replace("&","&amp;").replace(">","&gt;").replace("<","&lt;")),title)
-                            logger.info("continue_on_chapter_error: (%s) %s"%(url,e))
-                            logger.debug(traceback.format_exc())
-                            self.story.chapter_error_count += 1
                         else:
                             raise
 
@@ -782,7 +784,7 @@ try to download.</p>
                         (img['src'],longdesc)=self.story.addImgUrl(url,self.img_url_trans(img['src']),fetch,
                                                                    coverexclusion=self.getConfig('cover_exclusion_regexp'))
                         if longdesc:
-                            logger.debug("---set longdesc:%s"%longdesc)
+                            # logger.debug("---set longdesc:%s"%longdesc)
                             img['longdesc'] = longdesc
                 except AttributeError as ae:
                     logger.info("Parsing for img tags failed--probably poor input HTML.  Skipping img(%s)"%img)
@@ -833,7 +835,9 @@ try to download.</p>
                     ## handle identifiers that otherwise appear to be
                     ## selectors themselves.  #966
                     try:
-                        if href[0] == "#" and soup.select_one("[id='%s']"%href[1:]):
+                        # logger.debug("Search for internal link anchor href:(%s)"%href)
+                        if href[0] == "#" and soup.select_one("[id='%s'], [name='%s']"%(href[1:],href[1:])):
+                            # logger.debug("Found internal link anchor href:(%s)"%href)
                             hrefurl = href
                     except Exception as e:
                         logger.debug("Search for internal link anchor failed href:(%s)"%href)
@@ -843,29 +847,8 @@ try to download.</p>
 
                     ## make link absolute if not one of the above.
                     if not hrefurl:
-                        parsedUrl = urlparse(url)
-                        if href.startswith("//") :
-                            hrefurl = urlunparse(
-                                (parsedUrl.scheme,
-                                 '',
-                                 href,
-                                 '','',''))
-                        elif href.startswith("/") :
-                            hrefurl = urlunparse(
-                                (parsedUrl.scheme,
-                                 parsedUrl.netloc,
-                                 href,
-                                 '','',''))
-                        else:
-                            if parsedUrl.path.endswith("/"):
-                                toppath = parsedUrl.path
-                            else:
-                                toppath = parsedUrl.path[:parsedUrl.path.rindex('/')+1]
-                            hrefurl = urlunparse(
-                                (parsedUrl.scheme,
-                                 parsedUrl.netloc,
-                                 toppath + href,
-                                 '','',''))
+                        hrefurl = urljoin(url,href)
+                        logger.debug("urljoin: (%s)+(%s)->(%s)"%(url,href,hrefurl))
                     alink['href'] = hrefurl
                     # logger.debug("\n===========\nparsedUrl.path:%s\ntoppath:%s\nhrefurl:%s\n\n"%(parsedUrl.path,toppath,hrefurl))
 

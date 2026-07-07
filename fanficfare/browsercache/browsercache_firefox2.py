@@ -68,6 +68,7 @@ class FirefoxCache2(BaseBrowserCache):
         """Return True only if a directory is a valid Cache for this class"""
         # logger.debug("\n\n1Starting cache check\n\n")
         if not os.path.isdir(cache_dir):
+            logger.debug("Cache dir not found")
             return False
         ## check at least one entry file exists.
         for en_fl in glob.iglob(os.path.join(cache_dir, 'entries', '????????????????????????????????????????')):
@@ -75,6 +76,7 @@ class FirefoxCache2(BaseBrowserCache):
             k = _validate_entry_file(en_fl)
             if k is not None:
                 return True
+        logger.debug("No valid cache files found")
         return False
 
     def make_keys(self,url):
@@ -178,7 +180,23 @@ def _read_entry_headers(entry_file):
     ## \x00 separated tuples of name\x00value\x00name\x00value...
     moremetalist = moremetadata.split(b'\x00')
     # logger.debug(len(moremetalist))
-    moremetadict = {ensure_text(item) : ensure_text(moremetalist[index+2]) for index, item in enumerate(moremetalist[1:]) if index % 2 == 0}
+    # discard any empty first entries
+    while moremetalist[0] == b'':
+        moremetalist.pop(0)
+    # discard any empty last entries
+    while moremetalist[-1] == b'':
+        moremetalist.pop(-1)
+    # logger.debug(moremetalist)
+    moremetadict = {}
+    for index in range(0,len(moremetalist),2):
+        try:
+            moremetadict[ensure_text(moremetalist[index])] = ensure_text(moremetalist[index+1])
+        except IndexError:
+            ## currently (2026Jun) discarding empty entries above
+            ## makes list even for key:value.  But if it's not in
+            ## future, discard the last one.
+            logger.debug("Extra 'moremetadata' discarded")
+
     ## don't know what security-info contains, just that it's big.
     moremetadict.pop('security-info',None)
     ## add to retval

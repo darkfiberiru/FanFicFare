@@ -81,7 +81,11 @@ class TestSiteAdapter(BaseSiteAdapter):
                     if key in ['datePublished','dateUpdated']:
                         self.story.setMetadata(key,makeDate(self.get_config(sections,key),"%Y-%m-%d"))
                     else:
-                        self.story.setMetadata(key,ensure_text(self.get_config(sections,key)).replace('{{storyId}}',idstr))
+                        try:
+                            self.story.setMetadata(key,ensure_text(self.get_config(sections,key)).replace('{{storyId}}',idstr))
+                        except TypeError:
+                            ## ensure_text() errors when handed a bool.
+                            self.story.setMetadata(key,"%s"%self.get_config(sections,key))
                     #print("set:%s->%s"%(key,self.story.getMetadata(key)))
 
             if self.has_config(sections,'chapter_urls'):
@@ -416,11 +420,11 @@ Some more longer description.  "I suck at summaries!"  "Better than it sounds!" 
         else:
             if self.story.getMetadata('storyId') == '92':
                 imgtext='''
-<a href="http://code.google.com/p/fanficdownloader/wiki/FanFictionDownLoaderPluginWithReadingList" title="Tilt-a-Whirl"><img src="http://i.imgur.com/bo8eD.png"></a>
-<style>
-.loremipsum { background-image: url("https://picsum.photos/2000/1500") }
-</style>
-<p  style="background-image: url('https://picsum.photos/20/10')">Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.</p>
+<p  style="background-image: url('https://picsum.photos.invalid/20/10')">Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor</p>
+<p><a href="http://code.google.com/p/fanficdownloader/wiki/FanFictionDownLoaderPluginWithReadingList" title="Tilt-a-Whirl"><img src="http://i.imgur.com/bo8eD.png"></a></p>
+<p><img src="https://picsum.photos.invalid/2000/1500"></p>
+<p><img src='https://picsum.photos/1000/750'></p>
+<p><img src='https://picsum.photos/500/375'></p>
 '''
             else:
                 imgtext='img goes here when sid=92'
@@ -491,6 +495,7 @@ Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor 
             desc = '<div><p>The Great Test Series of '+self.getSiteDomain()+'!</p><p>Now with two lines!</p></div>'
         return {'name':'The Great Test',
                 'desc':desc,
+                'status':'AStatus',
                 'urllist':['http://'+self.getSiteDomain()+'?sid=1',
                            'http://'+self.getSiteDomain()+'?sid=2',
                            'http://'+self.getSiteDomain()+'?sid=3',

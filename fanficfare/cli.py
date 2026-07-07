@@ -345,6 +345,66 @@ def main(argv=None,
     urls=args
     dispatch(options, urls, passed_defaultsini, passed_personalini, warn, fail)
 
+def get_resume_filename(adapter):
+    """Per-story file for resume_partial_downloads saved page cache."""
+    import hashlib, tempfile
+    urlhash = hashlib.md5(adapter.url.encode('utf-8')).hexdigest()[:16]
+    return os.path.join(tempfile.gettempdir(),
+                        'ffdl-resume-%s-%s.pickle' % (adapter.getSiteDomain(),
+                                                      urlhash))
+
+def load_resume_cache(adapter, options, warn):
+    """If a previous download of this story failed partway, merge its
+    saved page cache so already-fetched pages aren't refetched.
+    Returns the resume filename, or None if the feature is off."""
+    import time
+    if not (adapter.getConfig('resume_partial_downloads')
+            and hasattr(options, 'basic_cache')):
+        return None
+    resume_file = get_resume_filename(adapter)
+    if os.path.exists(resume_file):
+        try:
+            expire_hours = float(adapter.getConfig('resume_partial_downloads_hours', 24))
+        except ValueError:
+            expire_hours = 24
+        age_hours = (time.time() - os.path.getmtime(resume_file)) / 3600.0
+        if age_hours > expire_hours:
+            print('Discarding expired partial download data (%.1f hours old): %s'
+                  % (age_hours, resume_file))
+            try:
+                os.remove(resume_file)
+            except OSError:
+                pass
+        else:
+            try:
+                count = options.basic_cache.merge_cache(resume_file)
+                print('Resuming: loaded %d previously fetched page(s) from %s'
+                      % (count, resume_file))
+            except Exception as e:
+                warn('Failed to load partial download data (%s), continuing without: %s'
+                     % (resume_file, e))
+    return resume_file
+
+def save_resume_cache(resume_file, options, warn):
+    """Save fetched pages after a failed download for later resume."""
+    if not (resume_file and hasattr(options, 'basic_cache')
+            and options.basic_cache.count() > 0):
+        return
+    try:
+        options.basic_cache.save_cache(resume_file)
+        print('Download failed: saved %d fetched page(s) for resume in %s'
+              % (options.basic_cache.count(), resume_file))
+    except Exception as e:
+        warn('Failed to save partial download data: %s' % e)
+
+def remove_resume_cache(resume_file):
+    """Download finished--remove any partial download data."""
+    if resume_file and os.path.exists(resume_file):
+        try:
+            os.remove(resume_file)
+        except OSError:
+            pass
+
 # make rest a function and loop on it.
 def do_download(arg,
                 options,
@@ -384,6 +444,7 @@ def do_download(arg,
                                       chaptercount,
                                       output_filename)
 
+    resume_file = None
     try:
         # Allow chapter range with URL.
         # like test1.com?sid=5[4-6] or [4,6]
@@ -391,6 +452,8 @@ def do_download(arg,
         url,ch_begin,ch_end = adapters.get_url_chapter_range(url)
 
         adapter = adapters.getAdapter(configuration, url)
+
+        resume_file = load_resume_cache(adapter, options, warn)
 
         # url[begin-end] overrides CLI option if present.
         if ch_begin or ch_end:
@@ -556,6 +619,11 @@ def do_download(arg,
         if adapter.story.chapter_error_count > 0:
             warn("===================\n!!!! %s chapters errored downloading %s !!!!\n==================="%(adapter.story.chapter_error_count,
                                                         url))
+        # Download completed--any saved partial download data is no
+        # longer needed.  Keep it after metaonly runs; a full download
+        # can still use it.
+        if not options.metaonly:
+            remove_resume_cache(resume_file)
         del adapter
 
     except exceptions.InvalidStoryURL as isu:
@@ -566,6 +634,12 @@ def do_download(arg,
         fail(us)
     except exceptions.AccessDenied as ad:
         fail(ad)
+    except BaseException:
+        # Download failed partway (network error, chapter error,
+        # Ctrl-C, ...)--save fetched pages so a rerun doesn't refetch
+        # them.  Includes KeyboardInterrupt, hence BaseException.
+        save_resume_cache(resume_file, options, warn)
+        raise
 
 def get_configuration(url,
                       passed_defaultsini,
@@ -648,6 +722,12 @@ def get_configuration(url,
 
     ## do page cache and cookie load after reading INI files because
     ## settings (like use_basic_cache) matter.
+
+    ## Route fetches through the basic cache so they can be
+    ## saved/restored around a failed download.  Must be set before any
+    ## get_fetcher() call.  CLI only--doesn't apply to the plugin.
+    if configuration.getConfig('resume_partial_downloads'):
+        configuration.resume_cache_active = True
 
     ## only need browser cache if one of the URLs needs it, and it
     ## isn't saved or dependent on options.save_cache.  This needs to

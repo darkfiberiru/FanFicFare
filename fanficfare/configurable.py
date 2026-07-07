@@ -207,6 +207,8 @@ def get_valid_set_options():
                'use_ssl_default_seclevelone':(None,None,boollist),
                'use_cloudscraper':(None,None,boollist),
                'use_basic_cache':(None,None,boollist),
+               'resume_partial_downloads':(None,None,boollist),
+               'resume_partial_downloads_hours':(None,None,None),
                'use_nsapa_proxy':(None,None,boollist),
                'use_flaresolverr_proxy':(None,None,boollist+['withimages','directimages']),
                'use_flaresolverr_session':(None,None,boollist),
@@ -565,6 +567,11 @@ class Configuration(ConfigParser):
         self.sleeper = None
         # caching layer for getting pages, create one if not given.
         self.basic_cache = basic_cache or fetchers.BasicCache()
+        # set (by CLI only) when resume_partial_downloads is active, so
+        # fetches go through the basic cache even for sites without
+        # use_basic_cache.  Deliberately not config-driven here so the
+        # Calibre plugin's caching behavior is unchanged.
+        self.resume_cache_active = False
         # don't create a browser cache by default.
         self.browser_cache = browser_cache
         self.filelist_fetcher = None # used for _filelist
@@ -1055,8 +1062,13 @@ class Configuration(ConfigParser):
             self.sleeper.decorate_fetcher(self.fetcher)
 
             ## cache decorator terminates the chain when found.
+            ## resume_cache_active: CLI resume_partial_downloads needs
+            ## fetches to go through the basic cache so they can be
+            ## saved/restored around a failed download, even for sites
+            ## without use_basic_cache.
             logger.debug("use_basic_cache:%s"%self.getConfig('use_basic_cache'))
-            if self.getConfig('use_basic_cache') and self.basic_cache is not None:
+            if (self.getConfig('use_basic_cache')
+                or self.resume_cache_active) and self.basic_cache is not None:
                 fetchers.BasicCacheDecorator(self.basic_cache).decorate_fetcher(self.fetcher)
 
             if self.getConfig('progressbar'):

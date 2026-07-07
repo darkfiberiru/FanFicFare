@@ -69,6 +69,21 @@ class BasicCache(object):
             pickle.dump(self.basic_cache,jout,protocol=2)
             # logger.debug("save cache(%s)"%(filename or self.filename))
 
+    def merge_cache(self,filename):
+        """Merge entries from a saved cache file into this cache without
+        discarding entries already in memory (in-memory entries win).
+        Returns the number of entries loaded from the file.
+        Used by resume_partial_downloads."""
+        with self.cache_lock, open(filename,'rb') as jin:
+            loaded = pickle_load(jin)
+            loaded.update(self.basic_cache)
+            self.basic_cache = loaded
+            return len(loaded)
+
+    def count(self):
+        with self.cache_lock:
+            return len(self.basic_cache)
+
     def make_cachekey(self, url, parameters=None):
         with self.cache_lock:
             keylist=[url]

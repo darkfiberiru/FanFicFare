@@ -22,6 +22,7 @@ import time
 from functools import partial
 
 from .log import make_log
+from .. import exceptions
 
 import logging
 logger = logging.getLogger(__name__)
@@ -104,13 +105,41 @@ class SleepDecorator(FetcherDecorator):
                            usecache=True,
                            image=False):
         # logger.debug("SleepDecorator fetcher_do_request")
-        fetchresp = chainfn(
-            method,
-            url,
-            parameters=parameters,
-            referer=referer,
-            usecache=usecache,
-            image=image)
+        try:
+            fetchresp = chainfn(
+                method,
+                url,
+                parameters=parameters,
+                referer=referer,
+                usecache=usecache,
+                image=image)
+        except exceptions.HTTPErrorFFF as e:
+            # The fetcher has already retried 429s with backoff by the
+            # time the error gets here--the site is persistently rate
+            # limiting us.  Bump the per-request sleep so the rest of
+            # the run backs off, then retry this request once at the
+            # slower pace.
+            bump = None
+            if e.status_code == 429:
+                bump = fetcher.getConfig('ratelimit_sleep_time')
+            if not bump:
+                raise
+            bump = float(bump)
+            if bump <= float(self.sleep_override or 0):
+                # Already backed off--retrying even slower won't help.
+                raise
+            logger.warning("Rate limited (HTTP 429); raising"
+                           " slow_down_sleep_time to %s and retrying" % bump)
+            self.set_sleep_override(bump)
+            time.sleep(bump)
+            # If still rate limited, the exception propagates.
+            fetchresp = chainfn(
+                method,
+                url,
+                parameters=parameters,
+                referer=referer,
+                usecache=usecache,
+                image=image)
 
         # don't sleep cached results.  Usually MemCache results will
         # be before sleep, but check fetchresp.fromcache for file://

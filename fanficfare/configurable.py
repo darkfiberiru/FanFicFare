@@ -432,6 +432,7 @@ def get_valid_keywords():
                  'output_filename_safepattern',
                  'password',
                  'post_process_cmd',
+                 'ratelimit_sleep_time',
                  'rating_titles',
                  'reader_posts_per_page',
                  'remove_tags',

@@ -110,8 +110,11 @@ dependencies = [ # Optional
              'requests >= 2.25.1', # otherwise version issues with urllib3
              'requests-file',
              'brotli',
-             'apsw',
              'pywin32; platform_system=="Windows"']
+# apsw is a native module some embedding platforms can't build
+# (e.g. Python-in-Android); it's only needed for reading Chrome's
+# SQL-based disk cache and FFF degrades gracefully without it, so
+# it's an extra rather than a hard dependency.
 # html5lib requires 'six', FFF includes it's own copy as fanficfare.six
 
 # List additional groups of dependencies here (e.g. development
@@ -124,6 +127,7 @@ dependencies = [ # Optional
 # projects.
 [project.optional-dependencies] # Optional
 image_processing = ['Pillow >= 3.3.0']
+chrome_sqldb_cache = ['apsw']
 
 # List URLs that are relevant to your project
 #

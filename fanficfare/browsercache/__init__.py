@@ -22,10 +22,19 @@ from .base_browsercache import BaseBrowserCache, CACHE_DIR_CONFIG
 from .browsercache_simple import SimpleCache
 from .browsercache_blockfile import BlockfileCache
 from .browsercache_firefox2 import FirefoxCache2
-from .browsercache_sqldb import SqldbCache
+## SqldbCache requires apsw, a native module that isn't available on
+## every platform FFF gets embedded in (e.g. Python-in-Android apps).
+## Treat it as optional--without apsw, only Chrome's SQL-based disk
+## cache flavor is unavailable.
+try:
+    from .browsercache_sqldb import SqldbCache
+except ImportError:
+    SqldbCache = None
 
 import logging
 logger = logging.getLogger(__name__)
+if SqldbCache is None:
+    logger.debug("apsw not importable: Chrome SQL-based browser cache (SqldbCache) disabled")
 
 class BrowserCache(object):
     """
@@ -35,7 +44,7 @@ class BrowserCache(object):
     def __init__(self, site, getConfig_fn, getConfigList_fn):
         """Constructor for BrowserCache"""
         # import of child classes have to be inside the def to avoid circular import error
-        for browser_cache_class in [SimpleCache, BlockfileCache, FirefoxCache2, SqldbCache]:
+        for browser_cache_class in filter(None, [SimpleCache, BlockfileCache, FirefoxCache2, SqldbCache]):
             self.browser_cache_impl = browser_cache_class.new_browser_cache(site,
                                                                             getConfig_fn,
                                                                             getConfigList_fn)

@@ -500,6 +500,21 @@ def do_download(arg,
                             # for non-interactive, default the response to yes and continue processing
                             print('y')
 
+        # Read the old epub's data BEFORE fetching metadata so adapters
+        # can see which chapters are already owned during the metadata/
+        # ToC phase (e.g. royalroad Wayback stub recovery skips
+        # re-archiving chapters the epub already contains).
+        if update_story and not options.force and chaptercount and output_filename:
+            (url,
+             chaptercount,
+             adapter.oldchapters,
+             adapter.oldimgs,
+             adapter.oldcover,
+             adapter.calibrebookmark,
+             adapter.logfile,
+             adapter.oldchaptersmap,
+             adapter.oldchaptersdata) = (get_update_data(output_filename))[0:9]
+
         # three tries, that's enough if both user/pass & is_adult needed,
         # or a couple tries of one or the other
         for x in range(0, 4):
@@ -547,17 +562,8 @@ def do_download(arg,
             else:
                 # update now handled by pre-populating the old
                 # images and chapters in the adapter rather than
-                # merging epubs.
-                (url,
-                 chaptercount,
-                 adapter.oldchapters,
-                 adapter.oldimgs,
-                 adapter.oldcover,
-                 adapter.calibrebookmark,
-                 adapter.logfile,
-                 adapter.oldchaptersmap,
-                 adapter.oldchaptersdata) = (get_update_data(output_filename))[0:9]
-
+                # merging epubs.  The old epub data was already read
+                # into the adapter before metadata was fetched, above.
                 print('Do update - epub(%d) vs url(%d)' % (chaptercount, urlchaptercount))
 
                 if not update_story and chaptercount == urlchaptercount and adapter.getConfig('do_update_hook'):

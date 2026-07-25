@@ -491,6 +491,28 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             result.append(entry)
         return result
 
+    def _owned_chapter_data(self):
+        """Map chapter id -> {'url','title'} for chapters already present
+        in the existing EPUB (populated for updates).  Lets stub recovery
+        skip re-fetching chapters we already own from the Wayback
+        Machine.  Requires oldchaptersmap to be attached before the
+        metadata fetch (cli.do_download does this; other frontends must
+        set adapter.oldchaptersmap before getStoryMetadataOnly())."""
+        owned = {}
+        if not self.oldchaptersmap:
+            return owned
+        id_re = re.compile(r'/chapter/(\d+)')
+        for old_url in self.oldchaptersmap:
+            m = id_re.search(old_url)
+            if not m:
+                continue
+            title = None
+            if self.oldchaptersdata and old_url in self.oldchaptersdata:
+                title = (self.oldchaptersdata[old_url].get('chapterorigtitle')
+                         or self.oldchaptersdata[old_url].get('chaptertitle'))
+            owned[m.group(1)] = {'url': old_url, 'title': title}
+        return owned
+
     def _wayback_recover_stub_chapters(self):
         """Recover missing chapters from Wayback Machine for a stubbed story.
         Merges archived chapters with current ToC, storing Wayback timestamps
@@ -516,12 +538,28 @@ class RoyalRoadAdapter(BaseSiteAdapter):
 
         logger.info("Found %d missing chapter(s) in Wayback archive" % len(missing_chapter_ids))
 
-        # Fetch an archived ToC that contains missing chapters.
-        # Try most recent snapshots first — accept the first one that contains
-        # at least some of the missing chapter IDs.
-        # toc_snapshots is list of (original_url, timestamp)
+        # Chapters already present in the EPUB being updated don't need
+        # to be re-archived--base FFF reuses their stored content.  Only
+        # genuinely-new missing chapters warrant archived-ToC hunting
+        # and per-chapter probing.
+        owned_chapters = self._owned_chapter_data()
+        owned_missing = missing_chapter_ids & set(owned_chapters)
+        unowned_missing = missing_chapter_ids - owned_missing
+        if owned_missing:
+            logger.info("%d of %d missing chapter(s) already in existing"
+                        " epub; reusing stored content"
+                        % (len(owned_missing), len(missing_chapter_ids)))
+
+        # Fetch an archived ToC covering the missing chapters we don't
+        # already own.  Try most recent snapshots first and keep the one
+        # covering the most unowned-missing chapters; stop early on full
+        # coverage.  toc_snapshots is list of (original_url, timestamp)
         archived_toc_chapters = []
+        best_coverage = 0
+        candidates_tried = 0
         for toc_original_url, timestamp in sorted(toc_snapshots, key=lambda x: x[1], reverse=True):
+            if not unowned_missing:
+                break
             try:
                 # Use the original URL from CDX (includes slug) so id_ fetch works
                 toc_original_url = self._ensure_https(toc_original_url)
@@ -529,30 +567,47 @@ class RoyalRoadAdapter(BaseSiteAdapter):
                 parsed = self._wayback_parse_toc(toc_data)
                 if not parsed:
                     continue
-                # Check if this ToC contains any of the missing chapters
+                candidates_tried += 1
+                # How many of the needed chapters does this ToC cover?
                 parsed_ids = set(c['chapter_id'] for c in parsed)
-                found_missing = parsed_ids & missing_chapter_ids
-                if found_missing:
+                found_missing = parsed_ids & unowned_missing
+                logger.debug("Archived ToC at %s: %d chapters"
+                             " (%d of %d needed missing chapters)"
+                             % (timestamp, len(parsed),
+                                len(found_missing), len(unowned_missing)))
+                if len(found_missing) > best_coverage:
+                    best_coverage = len(found_missing)
                     archived_toc_chapters = parsed
-                    logger.debug("Using archived ToC from timestamp %s with %d chapters"
-                                 " (%d of %d missing chapters found)"
-                                 % (timestamp, len(parsed),
-                                    len(found_missing), len(missing_chapter_ids)))
+                if best_coverage == len(unowned_missing):
+                    # Full coverage--no better ToC possible.
                     break
-                else:
-                    logger.debug("Skipping archived ToC at %s: %d chapters but"
-                                 " none are missing from current ToC"
-                                 % (timestamp, len(parsed)))
+                if candidates_tried >= 10:
+                    # Bound archive.org load; keep the best seen so far.
+                    break
             except Exception as e:
                 logger.debug("Failed to fetch archived ToC at %s: %s" % (timestamp, e))
                 continue
 
         if not archived_toc_chapters:
-            # Fallback: no usable archived ToC. Fetch titles from chapter pages.
-            logger.warning("No archived ToC found; fetching titles from chapter pages")
+            # Fallback: no usable archived ToC. Fetch titles from chapter
+            # pages (or reuse stored titles for owned chapters).
+            if unowned_missing:
+                logger.warning("No archived ToC found; fetching titles from chapter pages")
             archived_toc_chapters = []
             for chap_id in sorted(missing_chapter_ids, key=int):
                 if chap_id not in chapter_snapshots:
+                    continue
+                if chap_id in owned_chapters:
+                    # Already in the epub: no need to probe the archive
+                    # for content/title.  Keep the stored url so update
+                    # reuse matches trivially.
+                    _ts, orig_url = chapter_snapshots[chap_id]
+                    archived_toc_chapters.append({
+                        'title': (owned_chapters[chap_id]['title']
+                                  or self._title_from_wayback_url(orig_url)),
+                        'url': owned_chapters[chap_id]['url'],
+                        'chapter_id': chap_id,
+                    })
                     continue
                 resolved = self._wayback_resolve_missing_chapter(
                     chap_id, chapter_snapshots)
@@ -620,6 +675,20 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             for chap_id in unplaced_missing:
                 if chap_id not in chapter_snapshots:
                     continue
+                if chap_id in owned_chapters:
+                    # Already in the epub: skip the archive probe and
+                    # keep the stored url/title so update reuse matches
+                    # trivially.  wayback_chapters is still set as a
+                    # fallback in case reuse misses.
+                    ts, orig_url = chapter_snapshots[chap_id]
+                    chap_meta = {
+                        'title': (owned_chapters[chap_id]['title']
+                                  or self._title_from_wayback_url(orig_url)),
+                        'url': owned_chapters[chap_id]['url'],
+                    }
+                    self.wayback_chapters[chap_id] = (ts, self._ensure_https(orig_url))
+                    extra_chapters.append(chap_meta)
+                    continue
                 resolved = self._wayback_resolve_missing_chapter(
                     chap_id, chapter_snapshots)
                 if not resolved:
@@ -669,15 +738,16 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             if chap_id not in placed_current_ids:
                 merged.append(current_by_id[chap_id])
 
-        # Replace chapter list and rebuild index
+        # Replace chapter list and rebuild index.  Index EVERY merged
+        # entry by chapter id regardless of url form (live slug,
+        # archived-ToC slug, or stored-epub slug) so
+        # normalize_chapterurl() canonicalizes old and new urls to the
+        # same value and update reuse stays id-based.
         self.chapterUrls = merged
         self.chapterURLIndex = {}
-        chap_pattern_long = re.compile(
-            r'https?://(?:www\.)?royalroadl?\.com/fiction/\d+/[^/]+/chapter/(\d+)/[^/]+/?$')
-        chap_pattern_short = re.compile(
-            r'https?://(?:www\.)?royalroadl?\.com/fiction/\d+/chapter/(\d+)/?$')
+        chap_id_re = re.compile(r'/chapter/(\d+)')
         for i, chap in enumerate(self.chapterUrls):
-            match = chap_pattern_long.match(chap['url']) or chap_pattern_short.match(chap['url'])
+            match = chap_id_re.search(chap['url'])
             if match:
                 self.chapterURLIndex[match.group(1)] = i
         self.story.setMetadata('numChapters', self.num_chapters())

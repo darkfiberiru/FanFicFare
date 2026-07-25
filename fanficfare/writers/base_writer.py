@@ -216,7 +216,13 @@ class BaseStoryWriter(Requestable):
                 # get full story now, just before writing.  Fetch
                 # before opening file.
                 self.story = self.adapter.getStory(notification)
-            outstream = open(outfilename,"wb")
+            # Write to a temp file in the same directory and rename
+            # into place only after a successful write, so an error or
+            # interrupt mid-write can't truncate/corrupt an existing
+            # output file (especially important for updates, which
+            # would otherwise lose the old epub's chapters).
+            outtempname = outfilename + '.fff_tmp'
+            outstream = open(outtempname,"wb")
         else:
             close=False
             logger.debug("Save to stream")
@@ -225,22 +231,33 @@ class BaseStoryWriter(Requestable):
             # get full story now, just before writing.  Okay if double
             # called with above, it will only fetch once.
             self.story = self.adapter.getStory(notification)
-        if self.getConfig('zip_output'):
-            out = BytesIO()
-            self.zipout = ZipFile(outstream, 'w', compression=ZIP_DEFLATED)
-            self.writeStoryImpl(out)
-            self.zipout.writestr(self.getBaseFileName(),out.getvalue())
-            # declares all the files created by Windows.  otherwise, when
-            # it runs in appengine, windows unzips the files as 000 perms.
-            for zf in self.zipout.filelist:
-                zf.create_system = 0
-            self.zipout.close()
-            out.close()
-        else:
-            self.writeStoryImpl(outstream)
+        try:
+            if self.getConfig('zip_output'):
+                out = BytesIO()
+                self.zipout = ZipFile(outstream, 'w', compression=ZIP_DEFLATED)
+                self.writeStoryImpl(out)
+                self.zipout.writestr(self.getBaseFileName(),out.getvalue())
+                # declares all the files created by Windows.  otherwise, when
+                # it runs in appengine, windows unzips the files as 000 perms.
+                for zf in self.zipout.filelist:
+                    zf.create_system = 0
+                self.zipout.close()
+                out.close()
+            else:
+                self.writeStoryImpl(outstream)
+        except:
+            if close:
+                outstream.close()
+                try:
+                    os.remove(outtempname)
+                except OSError:
+                    pass
+            raise
 
         if close:
             outstream.close()
+            # atomic on both POSIX and Windows
+            os.replace(outtempname, outfilename)
 
     def writeFile(self, filename, data):
         logger.debug("writeFile:%s"%filename)

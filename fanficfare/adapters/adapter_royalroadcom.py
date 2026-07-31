@@ -491,6 +491,34 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             result.append(entry)
         return result
 
+    @staticmethod
+    def _numbering_regressions(titles):
+        """Find places where leading chapter-title numbers drop AND the
+        numbering later climbs back above the pre-drop value -- the
+        signature of a misplaced block ( ... 170, 1-5, 171 ... ).  A
+        genuine multi-book story restarting at 'Chapter 1' keeps
+        climbing from the restart and is NOT flagged.  Titles without
+        a leading number (or 'Chapter N') are ignored.  Returns list
+        of description strings, empty if order looks fine."""
+        num_re = re.compile(r'^\s*(?:ch(?:apter)?\.?\s*)?(\d+)', re.IGNORECASE)
+        nums = []   # (number, title) for numbered titles, in order
+        for t in titles:
+            m = num_re.match(t or '')
+            if m:
+                nums.append((int(m.group(1)), t))
+        suspects = []
+        for k in range(1, len(nums)):
+            if nums[k][0] < nums[k-1][0]:
+                pre_drop = nums[k-1][0]
+                # Misplaced block: numbering jumps back above the
+                # pre-drop value within the next 20 numbered titles.
+                for j in range(k+1, min(k+21, len(nums))):
+                    if nums[j][0] > pre_drop:
+                        suspects.append("'%s' after '%s'"
+                                        % (nums[k][1], nums[k-1][1]))
+                        break
+        return suspects
+
     def _owned_chapter_data(self):
         """Map chapter id -> {'url','title'} for chapters already present
         in the existing EPUB (populated for updates).  Lets stub recovery
@@ -558,19 +586,13 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         # self-heals on this update.
         epub_order_suspect = False
         if self.oldchaptersmap and not unowned_missing:
-            num_re = re.compile(r'^\s*(?:ch(?:apter)?\.?\s*)?(\d+)', re.IGNORECASE)
-            prev_num = None
+            old_titles = []
             for old_url in self.oldchaptersmap:
                 if self.oldchaptersdata and old_url in self.oldchaptersdata:
-                    t = (self.oldchaptersdata[old_url].get('chapterorigtitle')
-                         or self.oldchaptersdata[old_url].get('chaptertitle') or '')
-                    m = num_re.match(t)
-                    if m:
-                        num = int(m.group(1))
-                        if prev_num is not None and num < prev_num:
-                            epub_order_suspect = True
-                            break
-                        prev_num = num
+                    old_titles.append(
+                        self.oldchaptersdata[old_url].get('chapterorigtitle')
+                        or self.oldchaptersdata[old_url].get('chaptertitle') or '')
+            epub_order_suspect = bool(self._numbering_regressions(old_titles))
             if epub_order_suspect:
                 logger.info("Existing epub chapter order looks wrong (title"
                             " numbering regression); consulting archived ToC"
@@ -907,23 +929,13 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         logger.info("Merged chapter list: %d total (%d from Wayback)"
                      % (len(self.chapterUrls), len(self.wayback_chapters)))
 
-        # Cheap safety net: warn when chapter-title numbering regresses
-        # anywhere in the merged list — a mis-ordered book is the kind
-        # of fault a reader only notices hundreds of chapters in.
-        # Titles without a leading number (or 'Chapter N') are skipped;
-        # volume-relative numbering can false-positive, so log only.
-        num_re = re.compile(r'^\s*(?:ch(?:apter)?\.?\s*)?(\d+)', re.IGNORECASE)
-        prev_num = None
-        prev_title = None
-        regressions = []
-        for chap in self.chapterUrls:
-            m = num_re.match(chap['title'])
-            if m:
-                num = int(m.group(1))
-                if prev_num is not None and num < prev_num:
-                    regressions.append("'%s' after '%s'" % (chap['title'], prev_title))
-                prev_num = num
-                prev_title = chap['title']
+        # Cheap safety net: warn when chapter-title numbering shows a
+        # misplaced block anywhere in the merged list — a mis-ordered
+        # book is the kind of fault a reader only notices hundreds of
+        # chapters in.  Multi-book stories restarting at 'Chapter 1'
+        # are not flagged (see _numbering_regressions).
+        regressions = self._numbering_regressions(
+            [chap['title'] for chap in self.chapterUrls])
         if regressions:
             logger.warning("Merged chapter list has %d numbering"
                            " regression(s) — chapter order may be wrong:"

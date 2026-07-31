@@ -550,16 +550,64 @@ class RoyalRoadAdapter(BaseSiteAdapter):
                         " epub; reusing stored content"
                         % (len(owned_missing), len(missing_chapter_ids)))
 
+        # On updates the existing epub normally provides the chapter
+        # ordering (fallback below) and the ToC hunt is skipped.  But
+        # if the epub's own ordering looks wrong -- title numbering
+        # regressions, e.g. a book built before the preview-chapter
+        # ordering fix -- consult the archived ToC anyway so the order
+        # self-heals on this update.
+        epub_order_suspect = False
+        if self.oldchaptersmap and not unowned_missing:
+            num_re = re.compile(r'^\s*(?:ch(?:apter)?\.?\s*)?(\d+)', re.IGNORECASE)
+            prev_num = None
+            for old_url in self.oldchaptersmap:
+                if self.oldchaptersdata and old_url in self.oldchaptersdata:
+                    t = (self.oldchaptersdata[old_url].get('chapterorigtitle')
+                         or self.oldchaptersdata[old_url].get('chaptertitle') or '')
+                    m = num_re.match(t)
+                    if m:
+                        num = int(m.group(1))
+                        if prev_num is not None and num < prev_num:
+                            epub_order_suspect = True
+                            break
+                        prev_num = num
+            if epub_order_suspect:
+                logger.info("Existing epub chapter order looks wrong (title"
+                            " numbering regression); consulting archived ToC"
+                            " to rebuild the order")
+
         # Fetch an archived ToC covering the missing chapters we don't
-        # already own.  Try most recent snapshots first and keep the one
-        # covering the most unowned-missing chapters; stop early on full
-        # coverage.  toc_snapshots is list of (original_url, timestamp)
+        # already own.  Keep the candidate covering the most needed
+        # chapters; stop early on full coverage.
+        target_missing = unowned_missing if unowned_missing else missing_chapter_ids
         archived_toc_chapters = []
         best_coverage = 0
         candidates_tried = 0
-        for toc_original_url, timestamp in sorted(toc_snapshots, key=lambda x: x[1], reverse=True):
-            if not unowned_missing:
-                break
+        toc_candidates = []
+        if unowned_missing or epub_order_suspect:
+            # The main story query collapses to one capture per unique
+            # URL, which hides older captures of a ToC slug -- and the
+            # pre-stub ToCs (the ones actually listing the stubbed
+            # chapters) are precisely the older ones.  Query every ToC
+            # capture, then sample up to 10 candidates evenly across
+            # the timeline so both pre- and post-stub eras are tried.
+            rows = self._wayback_cdx_query(
+                'www.royalroad.com/fiction/%s/*' % story_id,
+                extra_filter='original:.*/fiction/%s/[^/]+$' % story_id,
+                collapse=False)
+            all_caps = sorted(set((r[1], r[0]) for r in rows), reverse=True)
+            if not all_caps:
+                all_caps = sorted(((ts, u) for u, ts in toc_snapshots),
+                                  reverse=True)
+            if len(all_caps) > 10:
+                idxs = sorted(set(round(i*(len(all_caps)-1)/9.0)
+                                  for i in range(10)))
+                toc_candidates = [all_caps[i] for i in idxs]
+            else:
+                toc_candidates = all_caps
+            logger.debug("Trying %d of %d archived ToC captures"
+                         % (len(toc_candidates), len(all_caps)))
+        for timestamp, toc_original_url in toc_candidates:
             try:
                 # Use the original URL from CDX (includes slug) so id_ fetch works
                 toc_original_url = self._ensure_https(toc_original_url)
@@ -570,15 +618,15 @@ class RoyalRoadAdapter(BaseSiteAdapter):
                 candidates_tried += 1
                 # How many of the needed chapters does this ToC cover?
                 parsed_ids = set(c['chapter_id'] for c in parsed)
-                found_missing = parsed_ids & unowned_missing
+                found_missing = parsed_ids & target_missing
                 logger.debug("Archived ToC at %s: %d chapters"
                              " (%d of %d needed missing chapters)"
                              % (timestamp, len(parsed),
-                                len(found_missing), len(unowned_missing)))
+                                len(found_missing), len(target_missing)))
                 if len(found_missing) > best_coverage:
                     best_coverage = len(found_missing)
                     archived_toc_chapters = parsed
-                if best_coverage == len(unowned_missing):
+                if best_coverage == len(target_missing):
                     # Full coverage--no better ToC possible.
                     break
                 if candidates_tried >= 10:
@@ -589,25 +637,49 @@ class RoyalRoadAdapter(BaseSiteAdapter):
                 continue
 
         if not archived_toc_chapters:
-            # Fallback: no usable archived ToC. Fetch titles from chapter
-            # pages (or reuse stored titles for owned chapters).
-            if unowned_missing:
+            # Fallback: no usable archived ToC (common on updates,
+            # where the ToC hunt is skipped because everything needed
+            # is owned).
+            if self.oldchaptersmap:
+                # Use the existing epub's own chapter order as the
+                # backbone -- without an archived ToC it is the best
+                # ordering authority available.  Include still-live
+                # chapters so they anchor the live-ToC placement
+                # below.  (oldchaptersmap preserves epub spine order.)
+                id_re = re.compile(r'/chapter/(\d+)')
+                seen_ids = set()
+                for old_url in self.oldchaptersmap:
+                    m = id_re.search(old_url)
+                    if not m or m.group(1) in seen_ids:
+                        continue
+                    chap_id = m.group(1)
+                    seen_ids.add(chap_id)
+                    if chap_id in current_chapter_ids:
+                        # Still live; merge walk below places the
+                        # current version at this (epub) position.
+                        archived_toc_chapters.append({
+                            'title': owned_chapters.get(chap_id,{}).get('title') or '',
+                            'url': owned_chapters.get(chap_id,{}).get('url') or old_url,
+                            'chapter_id': chap_id,
+                        })
+                    elif chap_id in chapter_snapshots:
+                        # Owned wayback chapter: keep the stored url so
+                        # update reuse matches trivially, no probing.
+                        archived_toc_chapters.append({
+                            'title': (owned_chapters[chap_id]['title']
+                                      or self._title_from_wayback_url(old_url)),
+                            'url': owned_chapters[chap_id]['url'],
+                            'chapter_id': chap_id,
+                        })
+                    # else: gone from both site and archive (e.g. a
+                    # deleted announcement chapter) -- dropped, same as
+                    # before.
+                # Unowned missing chapters (not in the epub) fall
+                # through to the per-chapter probe path below.
+            elif unowned_missing:
                 logger.warning("No archived ToC found; fetching titles from chapter pages")
-            archived_toc_chapters = []
-            for chap_id in sorted(missing_chapter_ids, key=int):
+            for chap_id in ([] if self.oldchaptersmap else sorted(missing_chapter_ids, key=int)):
                 if chap_id not in chapter_snapshots:
-                    continue
-                if chap_id in owned_chapters:
-                    # Already in the epub: no need to probe the archive
-                    # for content/title.  Keep the stored url so update
-                    # reuse matches trivially.
-                    _ts, orig_url = chapter_snapshots[chap_id]
-                    archived_toc_chapters.append({
-                        'title': (owned_chapters[chap_id]['title']
-                                  or self._title_from_wayback_url(orig_url)),
-                        'url': owned_chapters[chap_id]['url'],
-                        'chapter_id': chap_id,
-                    })
                     continue
                 resolved = self._wayback_resolve_missing_chapter(
                     chap_id, chapter_snapshots)
@@ -710,33 +782,113 @@ class RoyalRoadAdapter(BaseSiteAdapter):
             # Build a map of chapter_id -> position for the merged list,
             # then interleave extra chapters based on ID ordering.
             if extra_chapters and merged:
-                # Get chapter IDs for each position in merged list
+                # Get chapter IDs for each position in merged list.
+                # Extras are original-era Wayback chapters, so their id
+                # order is only meaningful relative to OTHER Wayback
+                # entries: still-live chapters can be re-posts (e.g. a
+                # stubbed story's free preview of chapters 1-5) whose
+                # brand-new ids would poison the comparison, and their
+                # position already comes from ToC evidence anyway --
+                # skip them when finding the insertion point.
                 chap_id_re = re.compile(r'/chapter/(\d+)')
                 merged_ids = []
+                merged_is_wayback = []
                 for chap in merged:
                     m = chap_id_re.search(chap['url'])
-                    merged_ids.append(int(m.group(1)) if m else 0)
+                    cid = m.group(1) if m else None
+                    merged_ids.append(int(cid) if cid else 0)
+                    merged_is_wayback.append(bool(cid) and cid not in current_by_id)
 
-                # Insert each extra chapter before the first merged chapter
-                # with a higher ID
+                # Insert each extra chapter before the first Wayback
+                # merged chapter with a higher ID
                 for extra in reversed(extra_chapters):
                     m = chap_id_re.search(extra['url'])
                     extra_id = int(m.group(1)) if m else 0
                     insert_pos = len(merged)
                     for i, mid in enumerate(merged_ids):
-                        if mid > extra_id:
+                        if merged_is_wayback[i] and mid > extra_id:
                             insert_pos = i
                             break
                     merged.insert(insert_pos, extra)
                     merged_ids.insert(insert_pos, extra_id)
+                    merged_is_wayback.insert(insert_pos, True)
             else:
                 merged.extend(extra_chapters)
 
-        # Append any current chapters not found in the archived ToC
-        # (newer chapters added after archiving)
-        for chap_id in self.chapterURLIndex:
-            if chap_id not in placed_current_ids:
-                merged.append(current_by_id[chap_id])
+        # Place any current chapters not found in the archived ToC at
+        # the position matching the live ToC's ordering, NOT blindly at
+        # the end: besides genuinely-new chapters (which do belong at
+        # the end), stubbed stories can keep a few of the OLDEST
+        # chapters live as a free preview, re-posted under new chapter
+        # ids the archived ToC has never heard of — appending those
+        # would bury chapters 1-5 in the middle of the book.  The live
+        # ToC is authoritative for the relative order of everything
+        # still on the site, so walk it in order, tracking where the
+        # last still-live chapter sits in the merged list, and insert
+        # each unplaced live chapter immediately after it.
+        # (self.chapterURLIndex still holds the LIVE ToC here, in live
+        # order; it is rebuilt from the merged list below.)
+        moved_from_end = 0
+        unplaced_live = [cid for cid in self.chapterURLIndex
+                         if cid not in placed_current_ids]
+        if unplaced_live and len(unplaced_live) < len(self.chapterURLIndex):
+            # Some live chapters are already anchored in merged; walk
+            # the live ToC in order, tracking the merged position of
+            # the last live chapter seen.  Unplaced live chapters that
+            # come AFTER the last anchored live chapter are the
+            # genuinely-new tail and go to the very end (wayback
+            # chapters may sit between them and their live-ToC
+            # predecessor).  Earlier unplaced runs hug their anchor:
+            # leading ones go to the front -- e.g. re-posted preview
+            # chapters of a stubbed story, which sit at the TOP of the
+            # live ToC but have brand-new chapter ids the archived ToC
+            # never heard of.
+            live_ids = list(self.chapterURLIndex)
+            last_anchor_livepos = -1
+            for pos, cid in enumerate(live_ids):
+                if cid in placed_current_ids:
+                    last_anchor_livepos = pos
+            anchor = -1  # merged index of the last live chapter walked past
+            for pos, chap_id in enumerate(live_ids):
+                if chap_id in placed_current_ids:
+                    anchor = merged.index(current_by_id[chap_id])
+                elif pos > last_anchor_livepos:
+                    # new tail: nothing anchored follows in live order
+                    merged.append(current_by_id[chap_id])
+                    placed_current_ids.add(chap_id)
+                else:
+                    anchor += 1
+                    merged.insert(anchor, current_by_id[chap_id])
+                    placed_current_ids.add(chap_id)
+                    if anchor != len(merged) - 1:
+                        moved_from_end += 1
+        elif unplaced_live:
+            # NO live chapter is anchored anywhere in merged, so the
+            # live ToC gives no relative position -- fall back to
+            # id-based insertion (before the first merged chapter with
+            # a higher id), like the extras above.  Never blindly
+            # hoist or append the whole live block.
+            chap_id_re = re.compile(r'/chapter/(\d+)')
+            merged_ids = []
+            for chap in merged:
+                m = chap_id_re.search(chap['url'])
+                merged_ids.append(int(m.group(1)) if m else 0)
+            for chap_id in unplaced_live:
+                live_id = int(chap_id)
+                insert_pos = len(merged)
+                for i, mid in enumerate(merged_ids):
+                    if mid > live_id:
+                        insert_pos = i
+                        break
+                merged.insert(insert_pos, current_by_id[chap_id])
+                merged_ids.insert(insert_pos, live_id)
+                placed_current_ids.add(chap_id)
+                if insert_pos != len(merged) - 1:
+                    moved_from_end += 1
+        if moved_from_end:
+            logger.info("Placed %d still-live chapter(s) by position"
+                        " instead of at the end (e.g. re-posted preview"
+                        " chapters of a stubbed story)" % moved_from_end)
 
         # Replace chapter list and rebuild index.  Index EVERY merged
         # entry by chapter id regardless of url form (live slug,
@@ -754,6 +906,29 @@ class RoyalRoadAdapter(BaseSiteAdapter):
 
         logger.info("Merged chapter list: %d total (%d from Wayback)"
                      % (len(self.chapterUrls), len(self.wayback_chapters)))
+
+        # Cheap safety net: warn when chapter-title numbering regresses
+        # anywhere in the merged list — a mis-ordered book is the kind
+        # of fault a reader only notices hundreds of chapters in.
+        # Titles without a leading number (or 'Chapter N') are skipped;
+        # volume-relative numbering can false-positive, so log only.
+        num_re = re.compile(r'^\s*(?:ch(?:apter)?\.?\s*)?(\d+)', re.IGNORECASE)
+        prev_num = None
+        prev_title = None
+        regressions = []
+        for chap in self.chapterUrls:
+            m = num_re.match(chap['title'])
+            if m:
+                num = int(m.group(1))
+                if prev_num is not None and num < prev_num:
+                    regressions.append("'%s' after '%s'" % (chap['title'], prev_title))
+                prev_num = num
+                prev_title = chap['title']
+        if regressions:
+            logger.warning("Merged chapter list has %d numbering"
+                           " regression(s) — chapter order may be wrong:"
+                           " %s" % (len(regressions),
+                                    '; '.join(regressions[:3])))
 
     ## Getting the chapter list and the meta data, plus 'is adult' checking.
     def extractChapterUrlsAndMetadata(self):

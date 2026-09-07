@@ -16,8 +16,10 @@
 #
 
 from __future__ import absolute_import
+import calendar
 import contextlib
 from datetime import datetime
+from html import unescape as html_unescape
 import json
 import logging
 import re
@@ -28,6 +30,17 @@ from ..htmlcleanup import stripHTML
 from .base_adapter import BaseSiteAdapter
 
 logger = logging.getLogger(__name__)
+
+## RR shows story status as a <span class="label">.  Shared by the
+## normal parse and the check-only fast path below.
+STATUS_LABELS = {
+    'COMPLETED': 'Completed',
+    'ONGOING'  : 'In-Progress',
+    'HIATUS'   : 'Hiatus',
+    'STUB'     : 'Stub',
+    'DROPPED'  : 'Dropped',
+    'INACTIVE' : 'Inactive',
+    }
 
 
 def getClass():
@@ -942,6 +955,105 @@ class RoyalRoadAdapter(BaseSiteAdapter):
                            " %s" % (len(regressions),
                                     '; '.join(regressions[:3])))
 
+    ## RR renders the chapter table from a JS global that carries
+    ## everything the table does -- id, order, title, url, date -- plus
+    ## volumeId.  Reading it costs a find() and a json.loads() instead
+    ## of an html5lib parse of the whole page, which is essentially the
+    ## entire CPU cost of an update check.  Only used when the caller
+    ## sets adapter.check_only; a normal download still does the full
+    ## parse because it needs description, tags, cover, word count etc.
+    def _extract_chapters_json(self, data):
+        """Return the list from the page's `window.chapters = [...]` JS
+        global, or None if it isn't present or isn't parseable."""
+        idx = data.find('window.chapters')
+        if idx < 0:
+            return None
+        start = data.find('[', idx)
+        if start < 0:
+            return None
+        try:
+            ## raw_decode() finds the end of the array itself; a regex
+            ## would have to guess, and chapter titles can contain the
+            ## delimiters.
+            rows, _ = json.JSONDecoder().raw_decode(data, start)
+        except ValueError as e:
+            logger.debug("window.chapters JSON parse failed: %s" % e)
+            return None
+        if not isinstance(rows, list) or not rows:
+            return None
+        return rows
+
+    def _json_chapter_date(self, isodate):
+        ## The chapter table carries a unixtime attr that make_date()
+        ## turns into local time via fromtimestamp(); window.chapters
+        ## carries UTC ISO instead.  Convert the same way so the two
+        ## paths produce identical dates.
+        stamp = datetime.strptime(isodate, '%Y-%m-%dT%H:%M:%SZ')
+        return datetime.fromtimestamp(calendar.timegm(stamp.timetuple()))
+
+    def _meta_content(self, data, attr, name):
+        m = re.search(r'<meta[^>]+%s="%s"[^>]+content="([^"]*)"'
+                      % (attr, re.escape(name)), data)
+        return html_unescape(m.group(1)) if m else None
+
+    def _extract_check_metadata(self, data):
+        """Populate just the metadata an update check needs -- chapter
+        list, status, title, author, dates -- without parsing the page
+        HTML.  Returns False if the page doesn't carry window.chapters,
+        in which case the caller falls back to the full parse (which
+        also handles RR's 200-with-a-404-page behaviour)."""
+        rows = self._extract_chapters_json(data)
+        if rows is None:
+            logger.debug("No window.chapters found, falling back to full parse")
+            return False
+
+        title = self._meta_content(data, 'name', 'twitter:title')
+        if title:
+            self.story.setMetadata('title', title)
+        author = self._meta_content(data, 'property', 'books:author')
+        if author:
+            self.story.setMetadata('author', author)
+
+        ## Status drives the caller's decision to try Wayback recovery,
+        ## so it has to be right.  Capture only the leading text of the
+        ## span, not up to </span>: the STUB label -- the one that
+        ## matters most here -- wraps an <i> popover icon after its text.
+        for label in re.findall(r'<span[^>]*class="[^"]*\blabel\b[^"]*"[^>]*>([^<]{0,60})',
+                                data):
+            label = html_unescape(label).strip()
+            if label in STATUS_LABELS:
+                self.story.setMetadata('status', STATUS_LABELS[label])
+
+        format = self.getConfig("datechapter_format",
+                                self.getConfig("datePublished_format", self.dateformat))
+        chap_pattern_long = r"https?://(?:www\.)?royalroadl?\.com/fiction/\d+/[^/]+/chapter/(\d+)/[^/]+/?$"
+        dates = []
+        for row in rows:
+            chapterUrl = 'https://' + self.getSiteDomain() + row['url']
+            othermeta = {}
+            try:
+                chapterDate = self._json_chapter_date(row['date'])
+                dates.append(chapterDate)
+                othermeta['date'] = chapterDate.strftime(format)
+            except (KeyError, ValueError) as e:
+                logger.debug("Unparsed window.chapters date %r: %s" % (row.get('date'), e))
+            if self.add_chapter(row.get('title'), chapterUrl, othermeta):
+                match = re.match(chap_pattern_long, chapterUrl)
+                if match:
+                    self.chapterURLIndex[match.group(1)] = len(self.chapterUrls) - 1
+
+        if not self.chapterUrls:
+            raise exceptions.FailedToDownload(
+                "Story has no chapters: %s" % self.url)
+
+        if dates:
+            self.story.setMetadata('datePublished', dates[0])
+            self.story.setMetadata('dateUpdated', dates[-1])
+
+        logger.debug("check-only metadata: %s chapters, status %s"
+                     % (len(self.chapterUrls), self.story.getMetadata('status')))
+        return True
+
     ## Getting the chapter list and the meta data, plus 'is adult' checking.
     def extractChapterUrlsAndMetadata(self):
 
@@ -952,6 +1064,14 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         self.performLogin()
 
         data = self.get_request(url)
+
+        ## An update check only needs the chapter list and the status,
+        ## both of which are available without parsing the page.  Falls
+        ## through to the full parse if the page doesn't carry them.
+        if self.check_only and self.getConfig('use_chapters_json', True):
+            if self._extract_check_metadata(data):
+                self._wayback_recover_if_stub()
+                return
 
         soup = self.make_soup(data)
         # print data
@@ -1008,18 +1128,8 @@ class RoyalRoadAdapter(BaseSiteAdapter):
                 self.story.addToList('genre',genre)
 
         for label in [stripHTML(a) for a in soup.find_all('span', {'class':'label'})]:
-            if 'COMPLETED' == label:
-                self.story.setMetadata('status', 'Completed')
-            elif 'ONGOING' == label:
-                self.story.setMetadata('status', 'In-Progress')
-            elif 'HIATUS' == label:
-                self.story.setMetadata('status', 'Hiatus')
-            elif 'STUB' == label:
-                self.story.setMetadata('status', 'Stub')
-            elif 'DROPPED' == label:
-                self.story.setMetadata('status', 'Dropped')
-            elif 'INACTIVE' == label:
-                self.story.setMetadata('status', 'Inactive')
+            if label in STATUS_LABELS:
+                self.story.setMetadata('status', STATUS_LABELS[label])
             elif 'Fan Fiction' == label:
                 self.story.addToList('category', 'FanFiction')
             elif 'Original' == label:
@@ -1054,6 +1164,11 @@ class RoyalRoadAdapter(BaseSiteAdapter):
                 self.story.setMetadata('numWords',m.group('words'))
 
         # Recover missing chapters from Wayback Machine for stubbed stories
+        self._wayback_recover_if_stub()
+
+    def _wayback_recover_if_stub(self):
+        ## Recovery works off chapterUrls/oldchaptersmap only -- no soup
+        ## -- so the check-only fast path can use it too.
         if (self.story.getMetadata('status') == 'Stub'
                 and self.getConfig('use_wayback_for_stubs', False)):
             try:

@@ -465,6 +465,8 @@ def get_valid_keywords():
                  'tocpage_entry',
                  'tocpage_start',
                  'user_agent',
+                 'use_chapters_json',
+                 'use_navigate_check',
                  'use_wayback_for_stubs',
                  'username',
                  'website_encodings',

@@ -16,6 +16,7 @@
 #
 
 from __future__ import absolute_import
+from html import unescape as html_unescape
 import logging
 logger = logging.getLogger(__name__)
 import re
@@ -155,6 +156,87 @@ class BaseOTWAdapter(BaseSiteAdapter):
             return True
 
     ## Getting the chapter list and the meta data, plus 'is adult' checking.
+    ## The /navigate page is a purpose-built chapter index -- no story
+    ## text -- and it carries title, author and every chapter with its
+    ## date.  Only tags, stats, summary and series need the work page.
+    ## So an update check can read /navigate alone and skip both the
+    ## second request and both html5lib parses.  Shape:
+    ##
+    ## <h2 class="heading">Chapter Index for <a href="/works/123">Title</a>
+    ##  by <a rel="author" href="/users/x/pseuds/y">Name</a></h2>
+    ## <ol class="chapter index group" role="navigation">
+    ##   <li><a href="/works/123/chapters/456">1. Title</a>
+    ##       <span class="datetime">(2025-05-15)</span></li>
+    def _strip_tags(self, text):
+        return html_unescape(re.sub(r'<[^>]+>', '', text)).strip()
+
+    def _navigate_check_metadata(self, data):
+        """Populate title, author and the chapter list from the /navigate
+        page alone, by regex.  Returns False if the page isn't shaped the
+        way we expect -- an adult interstitial, a login wall, an
+        unrevealed work -- so the caller can fall back to the full parse."""
+        storyId = self.story.getMetadata('storyId')
+        chap_href = r'/works/%s/chapters/\d+' % re.escape(storyId)
+
+        ## Count the plain chapter links the normal parse would find,
+        ## then the richer link+date form.  If the two disagree the page
+        ## isn't what we think it is; fall back rather than guess.
+        links = re.findall(r'<a href="(%s)"' % chap_href, data)
+        entries = re.findall(r'<a href="(%s)"[^>]*>(.*?)</a>\s*'
+                             r'<span class="datetime">\s*\(([^)]*)\)' % chap_href,
+                             data, re.DOTALL)
+        if not links:
+            logger.debug("No chapter links on navigate page, falling back to full parse")
+            return False
+        ## A single-chapter work has no datetime span; that's the one
+        ## legitimate mismatch, and the full parse special-cases it too.
+        if len(entries) != len(links) and not (len(links) == 1 and not entries):
+            logger.debug("navigate page chapter links(%s) != dated entries(%s), "
+                         "falling back to full parse" % (len(links), len(entries)))
+            return False
+
+        m = re.search(r'<a href="/works/%s">(.*?)</a>' % re.escape(storyId),
+                      data, re.DOTALL)
+        if not m:
+            logger.debug("No work title on navigate page, falling back to full parse")
+            return False
+        self.story.setMetadata('title', self._strip_tags(m.group(1)))
+
+        ## Mirrors the full parse: AO3 allows an 'Anonymous' author with
+        ## no pseud link at all.
+        alist = re.findall(r'<a[^>]*href="(/users/\w+/pseuds/[^"]+)"[^>]*>(.*?)</a>',
+                           data, re.DOTALL)
+        if not alist:
+            self.story.setMetadata('author', 'Anonymous')
+            self.story.setMetadata('authorUrl', 'https://' + self.getSiteDomain() + '/')
+            self.story.setMetadata('authorId', '0')
+        else:
+            for href, name in alist:
+                self.story.addToList('authorId', href.split('/')[-1])
+                self.story.addToList('authorUrl', 'https://' + self.host + href)
+                self.story.addToList('author', self._strip_tags(name))
+
+        newestChapter = None
+        self.newestChapterNum = None
+        if len(links) == 1 and not entries:
+            self.add_chapter(self.story.getMetadata('title'),
+                             'https://' + self.host + links[0])
+        else:
+            format = self.getConfig("datechapter_format",
+                                    self.getConfig("datePublished_format", "%Y-%m-%d"))
+            for index, (href, ctitle, date) in enumerate(entries):
+                chapterDate = makeDate(date.strip(), self.dateformat)
+                self.add_chapter(self._strip_tags(ctitle),
+                                 'https://' + self.host + href,
+                                 {'date': chapterDate.strftime(format)})
+                if newestChapter is None or chapterDate > newestChapter:
+                    newestChapter = chapterDate
+                    self.newestChapterNum = index
+
+        logger.debug("check-only metadata: %s chapters from navigate page"
+                     % len(self.chapterUrls))
+        return True
+
     def extractChapterUrlsAndMetadata(self):
 
         if self.is_adult or self.getConfig("is_adult"):
@@ -206,6 +288,22 @@ class BaseOTWAdapter(BaseSiteAdapter):
 
         if 'This site is in beta. Things may break or crash without notice.' in data:
             raise exceptions.FailedToDownload('Page failed to load, reported "This site is in beta".')
+
+        ## An update check only needs the chapter list, and /navigate
+        ## carries it along with title and author.  Taking it here skips
+        ## the work-page request entirely as well as both make_soup()
+        ## calls.  Every check below that reads `data` still has to run
+        ## first; anything unexpected falls through to the full path.
+        if self.check_only and self.getConfig('use_navigate_check', True):
+            if "Sorry, we couldn&#x27;t find the work you were looking for." in data:
+                raise exceptions.StoryDoesNotExist(self.url)
+            need_login = ( self.needToLoginCheck(data) or
+                           ( self.getConfig("always_login") and LOGOUT_STR not in data ) )
+            no_permission = re.search(r'<div class="flash error">Sorry, you don(\'|&#39;)t '
+                                      r'have permission to access the page you were trying to reach.</div>',
+                                      data)
+            if not need_login and not no_permission and self._navigate_check_metadata(data):
+                return
 
         meta = self.get_request(metaurl)
 

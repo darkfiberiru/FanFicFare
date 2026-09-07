@@ -83,6 +83,11 @@ class BaseSiteAdapter(Requestable):
 
         self.storyDone = False
         self.metadataDone = False
+        ## Set True by callers that only need enough metadata to answer
+        ## "does this story have new chapters?".  Adapters may use it to
+        ## take a cheaper path (see adapter_royalroadcom); those that
+        ## don't implement one simply ignore it and collect everything.
+        self.check_only = False
         self.story = Story(configuration)
         self.story.setMetadata('site',self.getConfigSection())
         self.story.setMetadata('dateCreated',datetime.now())
